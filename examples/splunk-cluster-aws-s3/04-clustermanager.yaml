@@ -6,15 +6,17 @@
 apiVersion: enterprise.splunk.com/v4
 kind: ClusterManager
 metadata:
+  annotations:
+    # kiam: propagated to the pod template by the operator via AppendParentMeta,
+    # so the pods assume this role. Must match the namespace's permitted regex.
+    # Changing this value changes the pod template -> rolling restart.
+    iam.amazonaws.com/role: SplunkS3Access
   name: cm
   namespace: splunk
   finalizers:
   - enterprise.splunk.com/delete-pvc
 spec:
   image: splunk/splunk:10.2.0
-  # IRSA: this SA's IAM role needs s3:GetObject/PutObject/DeleteObject/ListBucket
-  # on the SmartStore bucket, and read on the apps bucket.
-  serviceAccount: splunk-s3
   licenseManagerRef:
     name: lm
   monitoringConsoleRef:
@@ -52,8 +54,8 @@ spec:
         path: my-splunk-smartstore/idxc/
         endpoint: https://s3.us-east-1.amazonaws.com
         region: us-east-1
-        # Omit secretRef entirely when using IRSA (serviceAccount above).
-        # secretRef: s3-secret
+        # No secretRef: credentials come from kiam via the pod annotation
+        # above. Adding secretRef here would override that with static keys.
     indexes:
       - name: main
         remotePath: $_index_name

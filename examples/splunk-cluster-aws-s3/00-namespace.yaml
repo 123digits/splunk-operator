@@ -1,0 +1,20 @@
+# Namespace for the Splunk deployment, annotated for kiam.
+#
+# kiam authorises in two places and BOTH are required:
+#   1. the namespace declares which role names pods in it may assume
+#      (iam.amazonaws.com/permitted, a REGEX matched against the role name)
+#   2. each pod requests a specific role (iam.amazonaws.com/role)
+#
+# A pod asking for a role the namespace regex does not permit is refused by the
+# kiam server, and the AWS SDK inside splunkd sees credential failures, not a
+# clear error - so check the kiam-server logs first when S3 access fails.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: splunk
+  annotations:
+    # Narrow regex - permits only this role, not ".*". Anchor it: kiam matches
+    # the expression against the role name, so an unanchored value is a prefix
+    # match and permits more than you think.
+    iam.amazonaws.com/permitted: "^SplunkS3Access$"

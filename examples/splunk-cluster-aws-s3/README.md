@@ -95,36 +95,56 @@ kubectl -n splunk-operator set env deploy/splunk-operator-controller-manager \
 `01-storageclass.yaml` defines a gp3 class with `WaitForFirstConsumer` so each EBS
 volume lands in the same AZ as its pod. Requires the `aws-ebs-csi-driver` addon.
 
-### IAM (IRSA) — preferred over static keys
-One service account used by the CM, indexers, search heads, and the operator pod:
+### IAM via kiam
 
-```bash
-eksctl create iamserviceaccount \
-  --name splunk-s3 --namespace splunk --cluster <cluster> \
-  --attach-policy-arn arn:aws:iam::<acct>:policy/SplunkS3Access \
-  --approve
-```
+This deployment uses **kiam**, not IRSA. The difference matters: kiam authorises
+**pods**, IRSA authorises **service accounts**. So there is no
+`eks.amazonaws.com/role-arn` service account here, and `serviceAccount:` on the CRs
+does nothing for AWS access.
 
-`SplunkS3Access` needs, at minimum:
-- SmartStore bucket: `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, `s3:ListBucket`
-- Apps bucket: `s3:GetObject`, `s3:ListBucket`
-- With ingestion separation: `sqs:SendMessage`, `sqs:ReceiveMessage`,
-  `sqs:DeleteMessage`, `sqs:GetQueueUrl`, `sqs:GetQueueAttributes` on the queue + DLQ
+kiam needs authorisation in two places, and both must line up:
 
-Then set `serviceAccount: splunk-s3` on each CR (already done in these manifests) and
-**omit `secretRef`** from the S3 volume stanzas.
+| Where | Annotation | Set in |
+|---|---|---|
+| Namespace | `iam.amazonaws.com/permitted: "^SplunkS3Access$"` | `00-namespace.yaml` |
+| Pod | `iam.amazonaws.com/role: SplunkS3Access` | each CR's `metadata.annotations` |
 
-If you must use static keys instead:
+**Why annotating the CR works.** The operator copies the CR's own labels and
+annotations onto the StatefulSet's *pod template* — `AppendParentMeta` in
+`pkg/splunk/enterprise/configuration.go`, called from `getSplunkStatefulSet`, which
+every tier including the SHC deployer goes through. So an annotation on the CR lands
+on the pods, which is exactly what kiam reads. Verified identical at 3.1.0.
+
+Two consequences worth knowing:
+
+- `AppendParentMeta` **will not clobber** an annotation the operator already set on
+  the pod template. `iam.amazonaws.com/role` is not one the operator sets, so it
+  propagates cleanly — but this is why you annotate the CR rather than editing the
+  StatefulSet, which the operator would revert on its next reconcile.
+- Changing the annotation changes the pod template, which **triggers a rolling
+  restart** of that tier. Plan role changes accordingly.
+
+**Do not forget the operator itself.** The App Framework downloads app packages in
+the *operator* pod before copying them into the Splunk pods, so the
+`splunk-operator` namespace and the operator deployment need the same two
+annotations. See `00b-operator-namespace-kiam.yaml`. Missing this is a confusing
+failure: every Splunk tier is healthy and apps simply never install.
+
+Role setup, trust policy, and how to verify credentials are actually reaching the
+pods: see `iam/README.md`.
+
+### Static keys instead
+
+If you would rather not use kiam for the S3 volumes:
 
 ```bash
 kubectl -n splunk create secret generic s3-secret \
   --from-literal=s3_access_key=AKIA... \
   --from-literal=s3_secret_key=...
 ```
-and add `secretRef: s3-secret` to each volume stanza.
-
-The **operator pod itself** downloads app packages from S3, so it needs the same S3
-read access — annotate its service account too, and give it a staging PVC (see §6).
+and add `secretRef: s3-secret` to each volume stanza in `04-` and `06-`. The two
+mechanisms are mutually exclusive per volume — a `secretRef` takes precedence and
+kiam credentials are ignored for that volume.
 
 ### Buckets
 ```
@@ -354,7 +374,8 @@ Two things to check, because both bite silently:
 Contents of this directory:
 
 ```
-00-namespace-serviceaccount.yaml   Namespace + IRSA service account
+00-namespace.yaml                  Namespace, kiam permitted-role regex
+00b-operator-namespace-kiam.yaml   Notes: kiam wiring for the operator itself
 01-storageclass.yaml               gp3 class, WaitForFirstConsumer
 02-license-configmap.yaml.template NOT appliable - generate from your .lic
 03-licensemanager.yaml             LicenseManager
@@ -364,19 +385,20 @@ Contents of this directory:
 07-monitoringconsole.yaml          MonitoringConsole
 08-ingest-endpoints.yaml           NLB services for S2S 9997 + HEC 8088
 kustomization.yaml                 kubectl apply -k . (see caveat in the file)
-iam/                               IAM policy documents for the IRSA role
+iam/                               IAM policies + kiam trust policy + README
 optional/ingestion-separation.yaml Queue + ObjectStorage + IngestorCluster (10.2+)
 optional/heavy-forwarder-syslog.yaml Standalone HF tier for syslog
 ```
 
-Edit before applying: `<ACCOUNT_ID>` in `00-*` and `iam/*`, the bucket names and
+Edit before applying: the role name in `00-namespace.yaml` and each CR's
+`iam.amazonaws.com/role`, `<ACCOUNT_ID>` and `<KIAM_SERVER_NODE_ROLE>` in `iam/*`, the bucket names and
 region throughout `04-*` and `06-*`, and the LB hostnames in `08-*`.
 
 First bring-up, in order:
 
 ```bash
 # Prereqs: operator installed, SPLUNK_GENERAL_TERMS patched, buckets + IRSA role created
-kubectl apply -f 00-namespace-serviceaccount.yaml
+kubectl apply -f 00-namespace.yaml
 kubectl apply -f 01-storageclass.yaml
 kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic
 kubectl apply -f 03-licensemanager.yaml

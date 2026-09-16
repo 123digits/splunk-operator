@@ -21,8 +21,8 @@ spec:
     authRegion: us-east-1
     endpoint: https://sqs.us-east-1.amazonaws.com
     dlq: splunk-ingest-dlq
-    # Omit volumes when using IRSA; otherwise reference a secret holding
-    # s3_access_key / s3_secret_key.
+    # No volumes: credentials come from kiam via the IngestorCluster pod
+    # annotation. Only set volumes/secretRef if you must use static keys.
     # volumes:
     #   - name: s3-sqs-volume
     #     secretRef: s3-secret
@@ -41,6 +41,11 @@ spec:
 apiVersion: enterprise.splunk.com/v4
 kind: IngestorCluster
 metadata:
+  annotations:
+    # kiam: propagated to the pod template by the operator via AppendParentMeta,
+    # so the pods assume this role. Must match the namespace's permitted regex.
+    # Changing this value changes the pod template -> rolling restart.
+    iam.amazonaws.com/role: SplunkS3Access
   name: ingestor
   namespace: splunk
   finalizers:
@@ -48,8 +53,6 @@ metadata:
 spec:
   image: splunk/splunk:10.2.0
   replicas: 3
-  # Needs sqs:SendMessage/GetQueueUrl plus s3 write on the overflow bucket.
-  serviceAccount: splunk-s3
   licenseManagerRef:
     name: lm
   monitoringConsoleRef:

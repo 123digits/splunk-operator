@@ -1,0 +1,13 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KiamServerMayAssumeThisRole",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<ACCOUNT_ID>:role/<KIAM_SERVER_NODE_ROLE>"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}

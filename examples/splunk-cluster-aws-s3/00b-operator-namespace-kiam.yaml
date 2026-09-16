@@ -1,0 +1,23 @@
+# The OPERATOR also talks to S3 - the App Framework downloads app packages in
+# the operator pod before copying them into the Splunk pods. So the operator's
+# own namespace and pod need kiam wiring too, or app installs fail while the
+# Splunk tiers look perfectly healthy.
+#
+# The operator is installed from splunk-operator-cluster.yaml, so patch rather
+# than re-declare. Both commands are idempotent.
+#
+#   kubectl annotate namespace splunk-operator \
+#     iam.amazonaws.com/permitted="^SplunkS3Access$" --overwrite
+#
+#   kubectl -n splunk-operator patch deploy splunk-operator-controller-manager \
+#     --type=merge -p \
+#     '{"spec":{"template":{"metadata":{"annotations":{"iam.amazonaws.com/role":"SplunkS3Access"}}}}}'
+#
+# Verify the annotation landed on the POD, not just the Deployment:
+#   kubectl -n splunk-operator get pod -l control-plane=controller-manager \
+#     -o jsonpath='{.items[0].metadata.annotations}'
+#
+# If you prefer a separate, read-only role for the operator (it only needs GET
+# on the apps bucket, never the SmartStore bucket), create it from the
+# AppsBucket* statements in iam/splunk-s3-policy.json and widen the namespace
+# regex to cover both role names.

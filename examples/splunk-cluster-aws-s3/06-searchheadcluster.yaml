@@ -4,6 +4,11 @@
 apiVersion: enterprise.splunk.com/v4
 kind: SearchHeadCluster
 metadata:
+  annotations:
+    # kiam: propagated to the pod template by the operator via AppendParentMeta,
+    # so the pods assume this role. Must match the namespace's permitted regex.
+    # Changing this value changes the pod template -> rolling restart.
+    iam.amazonaws.com/role: SplunkS3Access
   name: shc
   namespace: splunk
   finalizers:
@@ -11,7 +16,6 @@ metadata:
 spec:
   image: splunk/splunk:10.2.0
   replicas: 3
-  serviceAccount: splunk-s3
   clusterManagerRef:
     name: cm
   licenseManagerRef:
