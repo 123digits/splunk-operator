@@ -1,0 +1,72 @@
+# OPTIONAL - a heavy forwarder tier for sources that cannot speak S2S or HEC
+# (syslog, SNMP traps, scripted inputs, DB connect).
+#
+# Nothing in the operator terminates syslog. A Standalone CR running as a
+# forwarder gives you somewhere to land it. The alternative is Splunk Connect
+# for Syslog writing to the HEC endpoint in 08-ingest-endpoints.yaml.
+---
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
+metadata:
+  name: hwf
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.2.0
+  replicas: 2
+  serviceAccount: splunk-s3
+  licenseManagerRef:
+    name: lm
+  clusterManagerRef:
+    name: cm
+  monitoringConsoleRef:
+    name: mc
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Queues/persistent queue only - a forwarder does not retain indexed data.
+    storageCapacity: 50Gi
+  # Forward everything on to the indexer cluster rather than indexing locally.
+  defaults: |-
+    splunk:
+      app_paths_install:
+        default: []
+  # Expose a syslog listener alongside the default ports. You still need a
+  # matching inputs.conf (ship it as a local-scope app via appRepo).
+  serviceTemplate:
+    spec:
+      type: LoadBalancer
+      ports:
+        - name: syslog-tcp
+          port: 5514
+          targetPort: 5514
+          protocol: TCP
+---
+# Dedicated LB for the syslog listener. Keep externalTrafficPolicy: Local so the
+# original client IP survives - syslog sourcetyping usually depends on it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-syslog
+  namespace: splunk
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: syslog-tcp
+      port: 5514
+      targetPort: 5514
+      protocol: TCP
+  selector:
+    app.kubernetes.io/managed-by: splunk-operator
+    app.kubernetes.io/component: standalone
+    app.kubernetes.io/name: standalone
+    app.kubernetes.io/part-of: splunk-hwf-standalone
+    app.kubernetes.io/instance: splunk-hwf-standalone

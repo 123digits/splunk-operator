@@ -1,0 +1,20 @@
+# NOT directly appliable - a license file cannot be committed to git.
+# Generate the real ConfigMap from your enterprise.lic:
+#
+#   kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic
+#
+# For multiple licenses:
+#   kubectl -n splunk create configmap splunk-licenses \
+#     --from-file=enterprise1.lic --from-file=enterprise2.lic
+# then set licenseUrl on the LicenseManager to the comma-separated paths:
+#   licenseUrl: "/mnt/licenses/enterprise1.lic,/mnt/licenses/enterprise2.lic"
+#
+# The resulting object looks like this:
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: splunk-licenses
+  namespace: splunk
+data:
+  enterprise.lic: |
+    <contents of your Splunk Enterprise license file>

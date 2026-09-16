@@ -1,0 +1,23 @@
+# Convenience only. Kustomize sorts by kind and does NOT guarantee ordering
+# between custom resources, so for a FIRST bring-up apply the numbered files in
+# order instead (see README §7) and wait for the ClusterManager to reach Ready
+# before the IndexerCluster. The operator retries, so an out-of-order apply
+# converges eventually - it is just slower and noisier to debug.
+#
+# Good for: re-applying a known-good cluster, diffing, or GitOps once stable.
+#   kubectl apply -k .
+#
+# Not included: 02-license-configmap.yaml.template (generate it from your .lic)
+# and anything under optional/.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace-serviceaccount.yaml
+  - 01-storageclass.yaml
+  - 03-licensemanager.yaml
+  - 04-clustermanager.yaml
+  - 05-indexercluster.yaml
+  - 06-searchheadcluster.yaml
+  - 07-monitoringconsole.yaml
+  - 08-ingest-endpoints.yaml

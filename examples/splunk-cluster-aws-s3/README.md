@@ -1,4 +1,6 @@
-# Clustered Splunk on EKS with S3 — what to deploy after the operator
+# Example: full clustered Splunk on EKS with S3
+
+`examples/splunk-cluster-aws-s3/`
 
 Reference deployment for a Splunk Validated Architecture **C3** (distributed clustered
 indexers + search head cluster, single site) on AWS, with S3 for SmartStore and app
@@ -48,9 +50,11 @@ Two version-specific cautions:
 | `SearchHeadCluster` | 1 (3+ members) | `splunk-shc-deployer-0`, `splunk-shc-search-head-{0..n}` | Search + your dashboards; deployer distributes apps |
 | `MonitoringConsole` | 1 | `splunk-mc-monitoring-console-0` | Health/topology view; auto-wires to every CR referencing it |
 
-Optional: `IngestorCluster` + `Queue` + `ObjectStorage` (CRDs present at 3.1.0, but
+Everything above is in the numbered files and is required. Under `optional/`:
+
+`IngestorCluster` + `Queue` + `ObjectStorage` (CRDs present at 3.1.0, but
 the feature requires a Splunk **10.2+** image — see §0) for ingestion
-separation, and `Standalone` for a heavy forwarder / syslog collector tier.
+separation, and a `Standalone` heavy-forwarder tier for syslog.
 
 Order matters only loosely — the operator retries — but license first, then cluster
 manager, then peers, then search heads, is the clean path.
@@ -88,7 +92,7 @@ kubectl -n splunk-operator set env deploy/splunk-operator-controller-manager \
 ```
 
 ### EBS CSI driver + StorageClass
-`00-storageclass.yaml` defines a gp3 class with `WaitForFirstConsumer` so each EBS
+`01-storageclass.yaml` defines a gp3 class with `WaitForFirstConsumer` so each EBS
 volume lands in the same AZ as its pod. Requires the `aws-ebs-csi-driver` addon.
 
 ### IAM (IRSA) — preferred over static keys
@@ -165,7 +169,7 @@ So the split is: **S3 = durable long-term retention; EBS = hot tier + cache.** T
 `storageCapacity` in these manifests reflects that — indexers get 500 GiB of `var`
 for cache and hot, not enough for full retention, because full retention is in S3.
 
-`ObjectStorage` (file 07) is a different thing entirely — it is the overflow bucket
+`ObjectStorage` (optional/) is a different thing entirely — it is the overflow bucket
 for oversized *ingestion queue messages*, not bucket storage. It does not replace
 SmartStore, and neither replaces EBS.
 
@@ -214,7 +218,7 @@ Indexer apps always go through the ClusterManager bundle.
 
 An app needed on both the deployer and the members must appear twice in `appSources`
 with **different names but the same location** and different scopes — see
-`deployerLocalApps` in `04-searchheadcluster.yaml`.
+`deployerLocalApps` in `06-searchheadcluster.yaml`.
 
 ### Updates
 `appsRepoPollIntervalSeconds: 900` re-checks S3 every 15 min and installs changes.
@@ -247,7 +251,7 @@ splunk-cm-cluster-manager-service 8000, 8089
 ```
 
 ### From outside the cluster
-`06-ingest-endpoints.yaml` puts an internal NLB in front of the indexer pods for both
+`08-ingest-endpoints.yaml` puts an internal NLB in front of the indexer pods for both
 9997 and 8088.
 
 **Indexer Discovery does not work on Kubernetes.** Forwarders cannot query the cluster
@@ -312,31 +316,92 @@ endpoint above.
 
 ## 6. Operator app-staging volume
 
-Without a PVC, the operator stages downloaded app packages **in RAM**. With any
-meaningful app set this will OOM the operator pod. Add a PVC named
-`splunk-operator-app-download` and mount it at `/opt/splunk/appframework/` — see
-`docs/AppFramework.md`, "Add a persistent storage volume to the Operator pod".
+The operator stages downloaded app packages on a PVC mounted at
+`/opt/splunk/appframework/`. **You do not create this** — at 3.1.0 the release
+manifest ships it, because `config/default` includes `../persistent-volume` in its
+bases. The shipped object is:
 
----
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-download          # in the splunk-operator namespace
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+Two things to check, because both bite silently:
+
+1. **It declares no `storageClassName`**, so it binds via your cluster's *default*
+   StorageClass. EKS clusters often have no default. If none exists the PVC stays
+   `Pending`, and because the mount is unconditional in the deployment, the
+   **operator pod never starts**. Either mark a class default or patch the PVC:
+
+   ```bash
+   kubectl -n splunk-operator get pvc app-download
+   kubectl -n splunk-operator get sc    # look for (default)
+   ```
+
+2. **10Gi is the default size and it is not resizable in place** unless your
+   StorageClass sets `allowVolumeExpansion`. Size it up front if your app set is
+   large — the framework stages every package it downloads before installing.
 
 ## 7. Apply
 
+Contents of this directory:
+
+```
+00-namespace-serviceaccount.yaml   Namespace + IRSA service account
+01-storageclass.yaml               gp3 class, WaitForFirstConsumer
+02-license-configmap.yaml.template NOT appliable - generate from your .lic
+03-licensemanager.yaml             LicenseManager
+04-clustermanager.yaml             ClusterManager + SmartStore(S3) + indexer apps
+05-indexercluster.yaml             IndexerCluster (3 peers)
+06-searchheadcluster.yaml          SearchHeadCluster (deployer + 3) + dashboards
+07-monitoringconsole.yaml          MonitoringConsole
+08-ingest-endpoints.yaml           NLB services for S2S 9997 + HEC 8088
+kustomization.yaml                 kubectl apply -k . (see caveat in the file)
+iam/                               IAM policy documents for the IRSA role
+optional/ingestion-separation.yaml Queue + ObjectStorage + IngestorCluster (10.2+)
+optional/heavy-forwarder-syslog.yaml Standalone HF tier for syslog
+```
+
+Edit before applying: `<ACCOUNT_ID>` in `00-*` and `iam/*`, the bucket names and
+region throughout `04-*` and `06-*`, and the LB hostnames in `08-*`.
+
+First bring-up, in order:
+
 ```bash
-kubectl apply -f 00-storageclass.yaml
+# Prereqs: operator installed, SPLUNK_GENERAL_TERMS patched, buckets + IRSA role created
+kubectl apply -f 00-namespace-serviceaccount.yaml
+kubectl apply -f 01-storageclass.yaml
 kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic
-kubectl apply -f 01-licensemanager.yaml
-kubectl apply -f 02-clustermanager.yaml
+kubectl apply -f 03-licensemanager.yaml
+kubectl apply -f 04-clustermanager.yaml
+
+# Let the CM settle before the peers - it owns the bundle they pull.
 kubectl -n splunk wait --for=jsonpath='{.status.phase}'=Ready clustermanager/cm --timeout=15m
-kubectl apply -f 03-indexercluster.yaml
-kubectl apply -f 04-searchheadcluster.yaml
-kubectl apply -f 05-monitoringconsole.yaml
-kubectl apply -f 06-ingest-endpoints.yaml
+
+kubectl apply -f 05-indexercluster.yaml
+kubectl apply -f 06-searchheadcluster.yaml
+kubectl apply -f 07-monitoringconsole.yaml
+kubectl apply -f 08-ingest-endpoints.yaml
 ```
 
 Watch:
 ```bash
 kubectl -n splunk get pods -w
 kubectl -n splunk get clustermanager,indexercluster,searchheadcluster,licensemanager,monitoringconsole
+```
+
+Expected steady state — 9 pods:
+```
+splunk-lm-license-manager-0        splunk-cm-cluster-manager-0
+splunk-idxc-indexer-0..2           splunk-shc-deployer-0
+splunk-shc-search-head-0..2        splunk-mc-monitoring-console-0
 ```
 
 Admin password:
@@ -348,8 +413,6 @@ Splunk Web:
 ```bash
 kubectl -n splunk port-forward service/splunk-shc-search-head-service 8000
 ```
-
----
 
 ## 8. Things that bite
 
