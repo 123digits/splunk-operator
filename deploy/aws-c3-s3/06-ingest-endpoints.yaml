@@ -1,0 +1,58 @@
+# Data ingest endpoints.
+#
+# Indexer pods already expose 9997 (S2S) and 8088 (HEC) on the operator-created
+# ClusterIP service "splunk-idxc-indexer-service". These two objects put an AWS NLB
+# in front of that so forwarders and HEC clients outside the cluster can reach it.
+#
+# Indexer Discovery does NOT work on Kubernetes. Forwarders must target the LB,
+# and the LB must resolve to >= 2 IPs so forwarder auto-LB still distributes data.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-ingest-s2s
+  namespace: splunk
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: s2s
+      port: 9997
+      targetPort: 9997
+      protocol: TCP
+  # Matches the labels the operator puts on indexer pods.
+  # part-of uses the ClusterManager name ("cm"), not the IndexerCluster name.
+  selector:
+    app.kubernetes.io/managed-by: splunk-operator
+    app.kubernetes.io/component: indexer
+    app.kubernetes.io/name: indexer
+    app.kubernetes.io/part-of: splunk-cm-indexer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-ingest-hec
+  namespace: splunk
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: hec
+      port: 8088
+      targetPort: 8088
+      protocol: TCP
+  selector:
+    app.kubernetes.io/managed-by: splunk-operator
+    app.kubernetes.io/component: indexer
+    app.kubernetes.io/name: indexer
+    app.kubernetes.io/part-of: splunk-cm-indexer

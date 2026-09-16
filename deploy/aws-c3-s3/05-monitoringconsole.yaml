@@ -1,0 +1,21 @@
+# MonitoringConsole - auto-discovers every CR in the namespace that sets
+# monitoringConsoleRef: {name: mc}. Deploy it even if you start it empty.
+apiVersion: enterprise.splunk.com/v4
+kind: MonitoringConsole
+metadata:
+  name: mc
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.2.0
+  licenseManagerRef:
+    name: lm
+  clusterManagerRef:
+    name: cm
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 20Gi

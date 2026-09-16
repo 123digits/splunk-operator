@@ -1,0 +1,87 @@
+# ClusterManager - the control point for the indexer tier.
+# It owns THREE things the indexers never define themselves:
+#   1. SmartStore config (indexes.conf / server.conf) -> pushed as the "splunk-operator" app
+#   2. Cluster-scoped apps (appRepo scope: cluster) -> /opt/splunk/etc/manager-apps -> bundle push
+#   3. Replication/search factors
+apiVersion: enterprise.splunk.com/v4
+kind: ClusterManager
+metadata:
+  name: cm
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.2.0
+  # IRSA: this SA's IAM role needs s3:GetObject/PutObject/DeleteObject/ListBucket
+  # on the SmartStore bucket, and read on the apps bucket.
+  serviceAccount: splunk-s3
+  licenseManagerRef:
+    name: lm
+  monitoringConsoleRef:
+    name: mc
+
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 20Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 50Gi
+
+  # Replication/search factor for the indexer cluster.
+  defaults: |-
+    splunk:
+      idxc:
+        replication_factor: 2
+        search_factor: 2
+
+  # ---- SmartStore: warm/cold buckets live in S3 ----
+  # Only ClusterManager and Standalone accept a smartstore stanza.
+  smartstore:
+    defaults:
+      volumeName: s3_smartstore
+    cacheManager:
+      # Keep recent data resident so common searches never fault from S3.
+      hotlistRecencySecs: 86400
+      hotlistBloomFilterRecencyHours: 360
+      maxConcurrentDownloads: 8
+      maxConcurrentUploads: 8
+    volumes:
+      - name: s3_smartstore
+        storageType: s3
+        provider: aws
+        path: my-splunk-smartstore/idxc/
+        endpoint: https://s3.us-east-1.amazonaws.com
+        region: us-east-1
+        # Omit secretRef entirely when using IRSA (serviceAccount above).
+        # secretRef: s3-secret
+    indexes:
+      - name: main
+        remotePath: $_index_name
+      - name: firewall
+        remotePath: $_index_name
+        maxGlobalDataSizeMB: 5000000
+      - name: applogs
+        remotePath: $_index_name
+
+  # ---- Apps/TAs that must land on every indexer peer ----
+  appRepo:
+    appsRepoPollIntervalSeconds: 900
+    defaults:
+      volumeName: s3_apps
+      scope: cluster
+    appSources:
+      # scope: cluster -> staged on CM, bundle-pushed to peers as etc/peer-apps.
+      # Indexer-side TAs (props/transforms/indexes) belong here.
+      - name: indexerTAs
+        location: indexer-apps/
+      # scope: local -> installed on the CM pod only.
+      - name: cmLocalApps
+        location: cm-apps/
+        scope: local
+    volumes:
+      - name: s3_apps
+        storageType: s3
+        provider: aws
+        path: my-splunk-apps/
+        endpoint: https://s3.us-east-1.amazonaws.com
+        region: us-east-1

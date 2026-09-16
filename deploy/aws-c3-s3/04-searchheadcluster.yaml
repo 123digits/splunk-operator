@@ -1,0 +1,79 @@
+# SearchHeadCluster - creates a deployer + N search heads (minimum 3).
+# This is where your existing dashboards/apps go: scope "cluster" stages them on the
+# deployer under etc/shcluster/apps and pushes to every member.
+apiVersion: enterprise.splunk.com/v4
+kind: SearchHeadCluster
+metadata:
+  name: shc
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.2.0
+  replicas: 3
+  serviceAccount: splunk-s3
+  clusterManagerRef:
+    name: cm
+  licenseManagerRef:
+    name: lm
+  monitoringConsoleRef:
+    name: mc
+
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Search heads hold apps + user objects (saved searches, dashboards); keep headroom.
+    storageCapacity: 30Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Search artifacts / dispatch dir, not indexed data.
+    storageCapacity: 100Gi
+
+  resources:
+    requests:
+      cpu: "4"
+      memory: 12Gi
+    limits:
+      cpu: "8"
+      memory: 24Gi
+
+  deployerResourceSpec:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+  appRepo:
+    appsRepoPollIntervalSeconds: 900
+    defaults:
+      volumeName: s3_apps
+      scope: cluster
+    appSources:
+      # Your existing dashboard apps: cluster scope -> replicated to all search heads.
+      - name: dashboardApps
+        location: search-apps/
+      # Search-time TAs (props/transforms/lookups/eventtypes).
+      - name: searchTAs
+        location: search-tas/
+      # Deployer-only apps. Note: an app needed on BOTH deployer and members must be
+      # listed twice with different names, same location, different scope.
+      - name: deployerLocalApps
+        location: search-apps/
+        scope: local
+    volumes:
+      - name: s3_apps
+        storageType: s3
+        provider: aws
+        path: my-splunk-apps/
+        endpoint: https://s3.us-east-1.amazonaws.com
+        region: us-east-1
+
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: search-head
+          app.kubernetes.io/part-of: splunk-shc-search-head

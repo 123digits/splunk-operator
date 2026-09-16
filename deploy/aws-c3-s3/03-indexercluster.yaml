@@ -1,0 +1,46 @@
+# IndexerCluster - the peers. Deliberately thin:
+#   - no smartstore stanza (inherited from the ClusterManager bundle)
+#   - no appRepo (not supported on this CRD; apps arrive via CM bundle push)
+# Spread peers across AZs so one zone loss cannot take the cluster down.
+apiVersion: enterprise.splunk.com/v4
+kind: IndexerCluster
+metadata:
+  name: idxc
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.2.0
+  replicas: 3
+  serviceAccount: splunk-s3
+  clusterManagerRef:
+    name: cm
+  licenseManagerRef:
+    name: lm
+  monitoringConsoleRef:
+    name: mc
+
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 15Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Sized for hot buckets + SmartStore cache, NOT for full retention.
+    storageCapacity: 500Gi
+
+  resources:
+    requests:
+      cpu: "4"
+      memory: 12Gi
+    limits:
+      cpu: "8"
+      memory: 24Gi
+
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: indexer
+          app.kubernetes.io/part-of: splunk-cm-indexer

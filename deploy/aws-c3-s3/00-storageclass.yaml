@@ -1,0 +1,18 @@
+# gp3 StorageClass for Splunk's two EBS volumes per pod.
+# SmartStore does NOT remove the need for these: /opt/splunk/etc holds config+apps,
+# and /opt/splunk/var holds hot buckets (always local) plus the SmartStore cache.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: splunk-gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  # Hot buckets + cache churn; raise iops/throughput for heavy indexing tiers.
+  iops: "6000"
+  throughput: "250"
+  encrypted: "true"
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+# WaitForFirstConsumer keeps the EBS volume in the same AZ as the pod that claims it.
+volumeBindingMode: WaitForFirstConsumer

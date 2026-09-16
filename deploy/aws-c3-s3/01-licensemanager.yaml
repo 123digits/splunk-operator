@@ -1,0 +1,29 @@
+# LicenseManager - owns enterprise.lic and serves it to every other tier.
+# Prereq:
+#   kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic
+apiVersion: enterprise.splunk.com/v4
+kind: LicenseManager
+metadata:
+  name: lm
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.2.0
+  # Mounts the ConfigMap at /mnt/licenses
+  volumes:
+    - name: licenses
+      configMap:
+        name: splunk-licenses
+  licenseUrl: /mnt/licenses/enterprise.lic
+  # Send the LM's own internal logs into the indexer cluster.
+  clusterManagerRef:
+    name: cm
+  monitoringConsoleRef:
+    name: mc
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 20Gi

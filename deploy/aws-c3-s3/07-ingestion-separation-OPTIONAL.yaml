@@ -1,0 +1,67 @@
+# OPTIONAL - Splunk 10.2+ only ("SmartBus" / index-ingest separation).
+#
+# Splits receiving from indexing: an IngestorCluster terminates S2S/HEC and publishes
+# to SQS; the IndexerCluster consumes from SQS and indexes. Large messages spill to S3.
+# Gives you independent scaling of ingest vs index, and a durable buffer.
+#
+# If you deploy this, ingest traffic targets the INGESTOR service, not the indexer
+# service, and 03-indexercluster.yaml must gain queueRef + objectStorageRef.
+# queueRef/objectStorageRef are immutable after creation. Skip this file unless you
+# specifically want ingestion separation - the plain C3 in 01-06 does not need it.
+---
+apiVersion: enterprise.splunk.com/v4
+kind: Queue
+metadata:
+  name: queue
+  namespace: splunk
+spec:
+  provider: sqs
+  sqs:
+    name: splunk-ingest
+    authRegion: us-east-1
+    endpoint: https://sqs.us-east-1.amazonaws.com
+    dlq: splunk-ingest-dlq
+    # Omit volumes when using IRSA; otherwise reference a secret holding
+    # s3_access_key / s3_secret_key.
+    # volumes:
+    #   - name: s3-sqs-volume
+    #     secretRef: s3-secret
+---
+apiVersion: enterprise.splunk.com/v4
+kind: ObjectStorage
+metadata:
+  name: os
+  namespace: splunk
+spec:
+  provider: s3
+  s3:
+    path: my-splunk-ingest-overflow/smartbus/
+    endpoint: https://s3.us-east-1.amazonaws.com
+---
+apiVersion: enterprise.splunk.com/v4
+kind: IngestorCluster
+metadata:
+  name: ingestor
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.2.0
+  replicas: 3
+  # Needs sqs:SendMessage/GetQueueUrl plus s3 write on the overflow bucket.
+  serviceAccount: splunk-s3
+  licenseManagerRef:
+    name: lm
+  monitoringConsoleRef:
+    name: mc
+  queueRef:
+    name: queue
+  objectStorageRef:
+    name: os
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Ingestors do not retain data; they forward to SQS.
+    storageCapacity: 50Gi
