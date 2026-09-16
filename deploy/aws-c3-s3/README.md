@@ -10,6 +10,34 @@ apply the resources below.
 
 ---
 
+## 0. Version provenance
+
+Everything here was verified against **tag `3.1.0`** (commit `85b1dcca`).
+
+The working checkout of `main` is only 5 commits ahead of that tag, and the diff
+touches just three files — `helm-chart/splunk-operator/values.yaml`,
+`pkg/splunk/enterprise/util.go`, and its test. The paths this guide is built on —
+`api/v4/`, `config/crd/bases/`, `config/examples/`, `docs/`, `.env`, and the port and
+label logic in `pkg/splunk/enterprise/{configuration,types,names}.go` — are
+**byte-identical at 3.1.0**. So the CRD fields, scopes, service ports, and pod labels
+below all hold for the 3.1.0 release.
+
+Two version-specific cautions:
+
+- **The Helm chart at 3.1.0 pins `docker.io/splunk/splunk:10.0.0`**, not 10.2.0. The
+  bump to 10.2.0 landed *after* the tag. If you install via Helm at 3.1.0 and take
+  the default, you get Splunk 10.0.0 — which is **too old for the ingestion
+  separation stack in file 07** (`IngestorCluster`/`Queue`/`ObjectStorage` require
+  10.2+). The CRDs are present at 3.1.0 either way, so this fails at runtime, not at
+  apply time. Override the image or pin it per CR.
+- **`RELATED_IMAGE_SPLUNK_ENTERPRISE` in the published release YAML is injected at
+  build time** from a CI secret, and the Makefile's own default is the untagged
+  `docker.io/splunk/splunk`. Do not rely on it. Every CR in this directory sets
+  `image:` explicitly, which is the behaviour you want anyway — it is what gives you
+  control of the upgrade cycle.
+
+---
+
 ## 1. What a full cluster consists of
 
 | CR | Count | Pods created | Why you need it |
@@ -20,7 +48,8 @@ apply the resources below.
 | `SearchHeadCluster` | 1 (3+ members) | `splunk-shc-deployer-0`, `splunk-shc-search-head-{0..n}` | Search + your dashboards; deployer distributes apps |
 | `MonitoringConsole` | 1 | `splunk-mc-monitoring-console-0` | Health/topology view; auto-wires to every CR referencing it |
 
-Optional: `IngestorCluster` + `Queue` + `ObjectStorage` (Splunk 10.2+) for ingestion
+Optional: `IngestorCluster` + `Queue` + `ObjectStorage` (CRDs present at 3.1.0, but
+the feature requires a Splunk **10.2+** image — see §0) for ingestion
 separation, and `Standalone` for a heavy forwarder / syslog collector tier.
 
 Order matters only loosely — the operator retries — but license first, then cluster
@@ -46,7 +75,12 @@ Splunk Enterprise 10.x containers will not start unless the operator deployment 
   value: "--accept-sgt-current-at-splunk-com"
 ```
 
-It defaults to an **empty string**. Patch it before applying any CR:
+It defaults to an **empty string**. At 3.1.0 this env var is injected into the
+deployment by kustomize (`config/default/kustomization.yaml`, placeholder
+`SPLUNK_GENERAL_TERMS_VALUE`) and the Makefile default is `""` — so the published
+`splunk-operator-cluster.yaml` ships it empty. Either pass it at deploy time
+(`make deploy SPLUNK_GENERAL_TERMS="--accept-sgt-current-at-splunk-com"`) or patch
+the running deployment before applying any CR:
 
 ```bash
 kubectl -n splunk-operator set env deploy/splunk-operator-controller-manager \
@@ -335,8 +369,9 @@ kubectl -n splunk port-forward service/splunk-shc-search-head-service 8000
 - **`queueRef` / `objectStorageRef` are immutable.** Decide on ingestion separation
   before creating the IndexerCluster.
 - **Scaling down a SearchHeadCluster below 3** is not valid Splunk clustering.
-- **The in-repo `config/examples/advanced/c3.yaml` and `c1.yaml` do not parse** — the
-  `smartstore.volumes` list is misindented. Use the manifests here instead.
+- **The in-repo `config/examples/advanced/c3.yaml` and `c1.yaml` do not parse at 3.1.0** — the
+  `smartstore.volumes` list is misindented. Confirmed by parsing the blobs straight
+  from the tag. Use the manifests here instead.
 
 ---
 
