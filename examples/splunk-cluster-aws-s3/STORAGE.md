@@ -42,21 +42,111 @@ index replication (RF ≥ 2) still matters with SmartStore — S3 durability doe
 not protect the newest data, peer replication does.
 
 **2. Warm buckets are cached locally to be searched.** SmartStore fetches a
-bucket from S3 onto local disk before it can be searched. The cache manager
-evicts by the settings in `04-clustermanager.yaml`:
-
-```yaml
-cacheManager:
-  hotlistRecencySecs: 86400              # keep the last day resident
-  hotlistBloomFilterRecencyHours: 360    # keep bloom filters longer than the data
-```
-
-Undersize this volume and searches thrash: every query faults buckets down from
-S3, evicting others, which the next query re-fetches. It shows up as slow
-searches and heavy S3 GET charges rather than as an error.
+bucket from S3 onto local disk before it can be searched. Undersize this volume
+and searches thrash: every query faults buckets down, evicting others the next
+query re-fetches. It shows up as slow searches and heavy S3 GET charges rather
+than as an error. Sizing detail in the next section.
 
 **3. Everything else splunkd writes is local.** The dispatch directory (search
 artifacts and results), splunkd logs, and the KV store on search heads.
+
+## What is actually on `/opt/splunk/var`, in detail
+
+### Hot buckets
+
+A **bucket** is a directory of indexed data covering a time range. Buckets have
+a lifecycle, and **hot** is the only stage that is open for writing:
+
+```
+hot ──roll──> warm ──upload──> S3        (SmartStore)
+ │
+ └─ local, being written to, NOT yet in S3
+```
+
+Incoming events land in a hot bucket on local disk. It rolls to warm when
+**either** limit is hit, whichever comes first:
+
+| Setting | Meaning | Common value |
+|---|---|---|
+| `maxDataSize` | Size cap per bucket | `auto` = 750MB, `auto_high_volume` = 10GB |
+| `maxHotSpanSecs` | Time span per bucket | varies |
+
+A restart also rolls hot buckets. On roll, SmartStore uploads the bucket to S3
+and it becomes a cache entry like any other.
+
+**How much space:** roughly
+`number of indexes × maxHotBuckets per index × maxDataSize`. With a handful of
+indexes at `auto_high_volume` and a few hot buckets each, that is tens of GB,
+not hundreds. It is the smaller part of `var`.
+
+**Why it matters more than its size:** hot buckets are the data **not yet in
+S3**. Object-storage durability does nothing for them. This is the whole reason
+`replication_factor: 2` is still set in `04-clustermanager.yaml` — peer
+replication is what protects data between arrival and upload.
+
+### SmartStore cache — how much?
+
+There is no "cache size" you set to a number and forget. The cache manager
+evicts when **either** condition is met:
+
+```
+occupied space  >  max_cache_size
+        ...OR...
+partition free space  <  (minFreeSpace + eviction_padding)
+```
+
+`max_cache_size = 0` disables the first rule, leaving only the free-space rule —
+so the cache grows until the partition is nearly full, then evicts LRU. That is
+the usual choice when the volume is dedicated to Splunk, which it is here.
+
+**In practice the cache is "whatever is left on the volume."** You do not size
+the cache; you size the volume, and the cache manager fills it. A `var` of 500Gi
+with ~50GB of hot buckets and overhead gives roughly 400GB+ of usable cache.
+
+Protected from eviction regardless:
+
+| CR setting | server.conf | What it protects |
+|---|---|---|
+| `hotlistRecencySecs: 86400` | `hotlist_recency_secs` | Buckets newer than 24h stay resident |
+| `hotlistBloomFilterRecencyHours: 360` | `hotlist_bloom_filter_recency_hours` | Bloom filters kept 15 days — they let Splunk skip buckets without downloading them |
+
+The bloom filter setting is the cheap win: keeping filters far longer than the
+data means a search over old data rejects irrelevant buckets without faulting
+them down from S3 at all.
+
+**Operator gotcha:** the operator only writes a `[cachemanager]` setting when it
+is **non-zero** — see `getSmartstoreServerConf` in
+`pkg/splunk/enterprise/configuration.go`. So setting `maxCacheSize: 0` in the CR
+does **not** write `max_cache_size = 0`; it writes nothing and leaves Splunk's
+built-in default in force. If you need the value set explicitly, confirm what
+your build actually defaults to and, if it is not what you want, ship it in a
+custom app rather than through the CR.
+
+Verify what is really in effect:
+
+```bash
+kubectl -n splunk exec splunk-idxc-indexer-0 -- \
+  /opt/splunk/bin/splunk btool server list cachemanager --debug
+kubectl -n splunk exec splunk-idxc-indexer-0 -- \
+  /opt/splunk/bin/splunk btool server list diskUsage --debug   # minFreeSpace
+```
+
+### splunkd logs
+
+`$SPLUNK_HOME/var/log/splunk/` — `splunkd.log`, `metrics.log`, audit and
+introspection logs. These rotate with size caps, so the footprint is bounded and
+modest: a few GB per pod. Not a sizing factor, but it shares the volume, so a
+full `var` also means splunkd cannot write its own logs.
+
+### Search artifacts
+
+`$SPLUNK_HOME/var/run/splunk/dispatch/` — one directory per search job holding
+results and metadata. Bounded by two things: a TTL after which the job is
+reaped, and `srchDiskQuota` per role.
+
+Largest on **search heads**, where interactive and scheduled searches run. On
+indexers the peers keep their portion of distributed searches, which is smaller.
+This is why the search heads here get 100Gi of `var` despite indexing nothing.
 
 ## So what does SmartStore actually save
 
