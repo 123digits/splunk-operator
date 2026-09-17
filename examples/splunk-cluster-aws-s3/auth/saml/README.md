@@ -123,12 +123,17 @@ client only.
 
 ## Roles
 
-`splunk_saml_app/default/authorize.conf` defines `s4k_hs_user` from scratch
-rather than importing the built-in `user` role, which is **not** read-only — it
-can create knowledge objects and schedule searches. Building up avoids a Splunk
-upgrade silently widening an inherited role.
+Both Keycloak realm roles map onto built-in Splunk roles, so nothing needs
+defining in `authorize.conf`:
 
-`s4k_hs_admin` maps onto the built-in `admin` role, so it needs no definition.
+| Keycloak realm role | Splunk role |
+|---|---|
+| `s4k_hs_admin` | `admin` |
+| `s4k_hs_user` | `user` |
+
+`user` is the least-privilege built-in and is fine for viewing existing
+dashboards, but note it is not strictly read-only — it can create its own
+knowledge objects and schedule searches.
 
 ## Certificate-based login
 

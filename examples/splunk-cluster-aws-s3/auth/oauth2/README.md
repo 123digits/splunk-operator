@@ -88,11 +88,11 @@ same realm role get the same access:
 | Keycloak realm role | Splunk role |
 |---|---|
 | `s4k_hs_admin` | `admin` (built-in) |
-| `s4k_hs_user` | `s4k_hs_user` (defined in `../saml/splunk_saml_app/default/authorize.conf`) |
+| `s4k_hs_user` | `user` (built-in) |
 
-`s4k_hs_user` is built from scratch rather than importing the built-in `user`
-role, which is not read-only — it can create knowledge objects and schedule
-searches.
+Both are built-in Splunk roles, so no `authorize.conf` is needed. Mind the
+direction: this stanza is `<Keycloak role> = <Splunk role>`, the reverse of
+`[roleMap_SAML]`.
 
 ## Deploy
 

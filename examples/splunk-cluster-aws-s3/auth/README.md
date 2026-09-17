@@ -50,11 +50,25 @@ access and both need auditing.
 | Keycloak realm | `jcsc-oauth` |
 | Client | `splunk-hs` |
 | Admin | realm role `s4k_hs_admin` -> Splunk `admin` |
-| Read-only | realm role `s4k_hs_user` -> Splunk `s4k_hs_user` |
+| Standard | realm role `s4k_hs_user` -> Splunk `user` |
 
-`s4k_hs_user` is defined in `saml/splunk_saml_app/default/authorize.conf`,
-built from scratch rather than importing the built-in `user` role, which can
-create knowledge objects and schedule searches and so is not read-only.
+Both map onto built-in Splunk roles, so there is no `authorize.conf` to ship.
+
+Worth knowing what `user` actually grants: it is not read-only. It can create
+and edit its own knowledge objects and schedule searches. For viewing existing
+dashboards that is usually fine and it is the least-privilege built-in, but if
+you later need true read-only, define a custom role rather than assuming `user`
+is one.
+
+**The two role-map stanzas run in opposite directions**, which is easy to invert:
+
+```ini
+[roleMap_SAML]                     # <Splunk role> = <Keycloak role>
+user = s4k_hs_user
+
+[oauth2_external_role_mapping_...] # <Keycloak role> = <Splunk role>
+s4k_hs_user = user
+```
 
 ## What is shared regardless
 
