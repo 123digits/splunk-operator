@@ -619,6 +619,8 @@ Contents of this directory:
 06-searchheadcluster.yaml          SearchHeadCluster (deployer + 3) + dashboards
 07-monitoringconsole.yaml          MonitoringConsole
 08-ingest-endpoints.yaml           NLB services for S2S 9997 + HEC 8088
+09-poddisruptionbudgets.yaml       One indexer / one search head down at a time
+10-karpenter-nodepool.yaml         Node pool + disruption budgets (cluster-scoped)
 kustomization.yaml                 kubectl apply -k . (see caveat in the file)
 iam/                               IAM policies + kiam trust policy + README
 optional/ingestion-separation.yaml Queue + ObjectStorage + IngestorCluster (10.2+)
@@ -646,6 +648,10 @@ kubectl apply -f 05-indexercluster.yaml
 kubectl apply -f 06-searchheadcluster.yaml
 kubectl apply -f 07-monitoringconsole.yaml
 kubectl apply -f 08-ingest-endpoints.yaml
+kubectl apply -f 09-poddisruptionbudgets.yaml
+
+# Cluster-scoped; apply if Karpenter manages these nodes
+kubectl apply -f 10-karpenter-nodepool.yaml
 ```
 
 Watch:
@@ -695,7 +701,102 @@ kubectl -n splunk port-forward service/splunk-shc-search-head-service 8000
 
 ---
 
-## 9. Multisite
+## 9. Placement, disruption and Karpenter
+
+Three separate mechanisms, each covering something the others cannot.
+
+### Separate nodes is enforced, not preferred
+
+The operator already adds a podAntiAffinity term on `kubernetes.io/hostname`,
+but only as **PreferredDuringScheduling** (`AppendPodAntiAffinity` in
+`pkg/splunk/common/util.go`). Preferred is best-effort — under capacity
+pressure the scheduler stacks two peers on one node, and one node failure then
+takes out two replicas.
+
+`05-indexercluster.yaml` and `06-searchheadcluster.yaml` add a
+**RequiredDuringScheduling** term, which is what actually enforces it. The
+operator appends its Preferred term to whatever the CR sets rather than
+replacing it, so both land on the pod.
+
+The cost is deliberate: you need at least as many schedulable nodes as
+replicas, in the right AZs, and a replica with nowhere to go stays `Pending`
+rather than doubling up.
+
+AZ spread stays **soft**. Hard zone spread would strand pods whenever a zone is
+tight, and EBS volumes are zonal anyway so a replacement must return to its
+original AZ regardless.
+
+### A PDB cannot bring the new pod up first
+
+This is worth being blunt about, because it is the usual expectation and it is
+not achievable:
+
+- A PDB does not sequence anything. It only answers "would evicting this pod
+  leave too few available?" and refuses if so.
+- A StatefulSet allows **one pod per ordinal**. There cannot be two
+  `splunk-idxc-indexer-1`.
+- The PVC is ReadWriteOnce and EBS attaches to one node at a time. The old pod
+  must terminate and detach before the replacement can attach.
+
+So the replacement necessarily reuses the original volume and its data — that
+part of your instinct is exactly right, and it has to happen in that order.
+
+What protects the data is **Splunk replication, not Kubernetes**. With
+`replication_factor: 2`, one peer down leaves every bucket with a copy. The
+PDB's only job is to ensure exactly one goes at a time.
+
+That matters more here than usual: the operator sets
+`PodManagementPolicy: Parallel`, so the StatefulSet will **not** serialise
+replacement. Without `09-poddisruptionbudgets.yaml`, a single node drain can
+take several peers at once.
+
+| Tier | PDB | Why |
+|---|---|---|
+| Indexers | `maxUnavailable: 1` | 2 down can lose both copies of a bucket at RF=2 |
+| Search heads | `maxUnavailable: 1` | Keeps the UI up and preserves captain majority (2 of 3) |
+| CM / LM / MC / deployer | **none** | See below |
+
+`maxUnavailable` rather than `minAvailable` so the budget stays correct when
+you scale. At 5 search heads, `minAvailable: 2` would permit 3 down and break
+quorum; `maxUnavailable: 1` does not.
+
+**No PDBs on the singletons.** A one-replica tier with `minAvailable: 1` can
+never satisfy an eviction, so Karpenter and `kubectl drain` block on that node
+forever. That is not high availability, it is a stuck cluster. Those tiers
+tolerate a restart — while the cluster manager is down, indexing and search
+continue, it just cannot push bundles. To protect one during a specific window,
+annotate the pod instead and remove it afterwards:
+
+```yaml
+metadata:
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"
+```
+
+Set on the CR, which the operator copies to the pod template.
+
+### Karpenter needs more than PDBs
+
+Two gaps PDBs do not close, both handled in `10-karpenter-nodepool.yaml`:
+
+- **`terminationGracePeriod` on the NodePool is a hard deadline.** When set,
+  Karpenter force-terminates the node when it expires, PDBs and all. It is
+  deliberately left unset so the PDBs are honoured.
+- **PDBs only gate voluntary disruption.** Spot reclamation, hardware failure
+  and crashes ignore them. That is what `replication_factor` is for — and why
+  the NodePool is on-demand only.
+
+`disruption.budgets` caps concurrent node disruption before per-pod PDBs even
+apply, and `consolidationPolicy: WhenEmpty` stops Karpenter repacking stateful
+pods for bin-packing, where every move costs a volume detach/attach and a
+Splunk restart.
+
+**The zonal trap:** a replacement pod must return to its PVC's AZ. If the
+NodePool cannot provision there — zone missing from `requirements`, or capacity
+exhausted — the pod stays `Pending` with its data intact but unreachable. List
+every AZ your volumes live in.
+
+## 10. Multisite
 
 For bucket replicas spread across AZs with site awareness, use one `IndexerCluster`
 per AZ pointing at a shared `ClusterManager`, each with a hardcoded `site` and zone
@@ -705,7 +806,7 @@ site-aware bucket placement.
 
 ---
 
-## 10. TLS and external access
+## 11. TLS and external access
 
 Two directories cover this, each with its own README:
 
@@ -735,7 +836,7 @@ all three with versions that validate against the internal CA and fail closed.
 Install the ConfigMap **before the first CR in the namespace** — the operator
 creates it with defaults if absent and never overwrites it afterwards.
 
-## 11. User login
+## 12. User login
 
 Client certificates authenticate **machines**, not people — there is no x509
 user login for Splunk Web, and no OIDC authorization-code flow either. Splunk's

@@ -104,6 +104,36 @@ spec:
         endpoint: https://s3.us-east-1.amazonaws.com
         region: us-east-1
 
+  # HARD separation: no two search head members may share a Kubernetes node.
+  #
+  # The operator already injects a podAntiAffinity term for this, but only as
+  # PreferredDuringScheduling (weight 100) - see AppendPodAntiAffinity in
+  # pkg/splunk/common/util.go. Preferred is best-effort: under pressure the
+  # scheduler will happily stack two peers on one node, and a single node
+  # failure then takes out two replicas at once.
+  #
+  # This Required term is what actually enforces it. The operator appends its
+  # Preferred term to whatever is set here rather than replacing it, so both
+  # end up on the pod.
+  #
+  # Consequence: you need at least as many schedulable nodes as replicas, in
+  # the right AZs. A replica with nowhere to go stays Pending rather than
+  # doubling up - which is the intended trade.
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/instance
+                operator: In
+                values:
+                  - splunk-shc-search-head
+          topologyKey: kubernetes.io/hostname
+
+  # AZ spread stays SOFT on purpose. Hard zone spread (DoNotSchedule) would
+  # leave pods Pending whenever a zone is short on capacity, and EBS volumes
+  # are already pinned to a zone - so a replacement must return to its original
+  # AZ regardless. Soft spread balances without blocking recovery.
   topologySpreadConstraints:
     - maxSkew: 1
       topologyKey: topology.kubernetes.io/zone

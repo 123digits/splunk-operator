@@ -1,0 +1,83 @@
+# Pod disruption budgets for the clustered tiers.
+#
+# READ THIS FIRST — a PDB cannot do what people usually want it to do.
+#
+# A PDB does NOT sequence anything. It cannot say "bring the replacement up
+# before taking the old one down." All it does is answer one question when
+# something asks to evict a pod: "would this leave too few available?" — and if
+# so, refuse the eviction until the count recovers.
+#
+# For a StatefulSet, "new pod first" is impossible regardless of PDB:
+#   1. StatefulSet guarantees at most ONE pod per ordinal. There cannot be two
+#      splunk-idxc-indexer-1 at the same time.
+#   2. The PVC is ReadWriteOnce and belongs to that ordinal. An EBS volume
+#      attaches to one node at a time, so the old pod must terminate and detach
+#      before the replacement can attach and start.
+#
+# So the replacement necessarily reuses the original pod's volume and its data,
+# which is the behaviour you want — it just has to happen in that order.
+#
+# What actually protects the data is Splunk's own replication: with
+# replication_factor 2, one peer being down still leaves every bucket with a
+# copy. The PDB's job is simply to guarantee that only ONE goes at a time.
+#
+# This matters more here than usual, because the operator sets
+# PodManagementPolicy: Parallel on its StatefulSets (see getSplunkStatefulSet).
+# The StatefulSet will NOT serialise replacement for you. Without these PDBs,
+# a node drain can take multiple peers simultaneously.
+---
+# Indexers: at most one peer down at a time.
+#
+# maxUnavailable rather than minAvailable so the budget stays correct when you
+# scale replicas. With replication_factor 2, one peer down leaves every bucket
+# with at least one copy; two down can lose both copies of some bucket, which
+# is the data loss this prevents.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: splunk-idxc-indexer
+  namespace: splunk
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: splunk-idxc-indexer
+---
+# Search heads: at most one member down, which keeps the UI available and
+# preserves the SHC captain majority.
+#
+# With 3 members, losing 1 leaves 2 — still a majority, so the cluster can hold
+# or elect a captain and users keep a working UI on the remaining members.
+# Losing 2 of 3 breaks quorum: no captain, no scheduled searches, degraded UI.
+#
+# maxUnavailable: 1 stays correct if you scale up. minAvailable: 2 would not —
+# at 5 members it would permit 3 down, which breaks quorum.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: splunk-shc-search-head
+  namespace: splunk
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: splunk-shc-search-head
+---
+# NOTE ON THE SINGLETONS — cluster manager, license manager, monitoring
+# console, deployer — there are deliberately NO PDBs for them.
+#
+# A one-replica tier with minAvailable: 1 (or maxUnavailable: 0) can never
+# satisfy an eviction, so Karpenter and `kubectl drain` block forever on that
+# node. You do not get high availability, you get a stuck cluster.
+#
+# These tiers tolerate a brief restart: while the cluster manager is down the
+# indexers keep indexing and searches keep running, it just cannot push bundles
+# or admit new peers. If you need to protect one during a specific maintenance
+# window, annotate the POD instead so Karpenter skips it entirely, and remove
+# the annotation afterwards:
+#
+#   karpenter.sh/do-not-disrupt: "true"
+#
+# Set it via the CR's metadata.annotations, which the operator copies onto the
+# pod template (AppendParentMeta). Leaving it on permanently blocks node
+# recycling and upgrades.

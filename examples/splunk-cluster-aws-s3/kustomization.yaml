@@ -7,8 +7,9 @@
 # Good for: re-applying a known-good cluster, diffing, or GitOps once stable.
 #   kubectl apply -k .
 #
-# Not included: 02-license-configmap.yaml.template (generate it from your .lic)
-# and anything under optional/.
+# Not included: 02-license-configmap.yaml.template (generate it from your .lic),
+# 10-karpenter-nodepool.yaml (cluster-scoped, likely managed separately from
+# this namespace), and anything under optional/.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -21,3 +22,4 @@ resources:
   - 06-searchheadcluster.yaml
   - 07-monitoringconsole.yaml
   - 08-ingest-endpoints.yaml
+  - 09-poddisruptionbudgets.yaml

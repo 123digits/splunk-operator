@@ -1,0 +1,69 @@
+# Karpenter NodePool for the Splunk tiers.
+#
+# PDBs alone are NOT sufficient with Karpenter. Two gaps they do not cover:
+#
+#   1. terminationGracePeriod on the NodePool is a HARD deadline. When set,
+#      Karpenter force-terminates the node when it expires, PDBs and all. Leave
+#      it unset (as here) so PDBs are actually honoured, or set it comfortably
+#      longer than a Splunk pod needs to shut down and reattach its volume.
+#
+#   2. PDBs only gate VOLUNTARY disruption. Spot reclamation, hardware failure
+#      and node crashes ignore them entirely. Splunk's replication_factor is
+#      what covers that case, not Kubernetes.
+#
+# disruption.budgets below is the real lever: it caps how many nodes Karpenter
+# will disrupt at once, cluster-wide, before per-pod PDBs even come into play.
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: splunk
+spec:
+  template:
+    metadata:
+      labels:
+        workload: splunk
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: splunk
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          # On-demand only. Spot reclamation is involuntary, so it bypasses
+          # every PDB here and can take several peers at once.
+          values: ["on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        # Must span every AZ your PVCs live in. An EBS volume is zonal, so a
+        # replacement pod has to return to its original AZ - if Karpenter
+        # cannot provision there, the pod stays Pending with the data intact
+        # but unreachable.
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-east-1a", "us-east-1b", "us-east-1c"]
+      # NO terminationGracePeriod here - see the note above.
+      expireAfter: 720h
+
+  disruption:
+    # Only consolidate genuinely empty nodes. WhenEmptyOrUnderutilized would
+    # repack Splunk pods for bin-packing reasons, and every move costs a volume
+    # detach/attach plus a Splunk restart on a stateful pod.
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+    budgets:
+      # At most one node disrupted at a time across this pool. Combined with
+      # the PDBs, that means at most one indexer and one search head are ever
+      # in flight.
+      - nodes: "1"
+      # Nothing voluntary during the working day. Adjust or drop if your
+      # maintenance expectations differ - times are UTC.
+      - schedule: "0 12 * * mon-fri"
+        duration: 10h
+        nodes: "0"
+
+  limits:
+    cpu: "200"
+    memory: 800Gi
