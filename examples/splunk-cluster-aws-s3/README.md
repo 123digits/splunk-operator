@@ -499,3 +499,17 @@ The operator's own probe scripts use `curl --insecure`. `tls/probes/` replaces
 all three with versions that validate against the internal CA and fail closed.
 Install the ConfigMap **before the first CR in the namespace** — the operator
 creates it with defaults if absent and never overwrites it afterwards.
+
+## 11. User login
+
+Client certificates authenticate **machines**, not people — there is no x509
+user login for Splunk Web. And Splunk Enterprise has no native OIDC/OAuth
+relying party; its SSO story is **SAML 2.0**.
+
+Keycloak speaks SAML natively alongside OIDC, so `saml/` configures Splunk
+against it directly rather than bridging through oauth2-proxy and a
+trusted-header scheme, which would be a header-spoofing exposure.
+
+Whatever you choose, **leave the local `admin` account working** — the operator
+authenticates as `admin` with the password from `splunk-<ns>-secret` to push
+bundles and manage the cluster.

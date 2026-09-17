@@ -27,6 +27,12 @@ spec:
       secret:
         secretName: splunk-public-tls
         defaultMode: 0400
+    # Keycloak realm signing cert -> /mnt/saml/keycloak-signing.pem,
+    # matching idpCertPath in saml/splunk_saml_app.
+    - name: saml
+      secret:
+        secretName: splunk-saml-idp
+        defaultMode: 0400
   extraEnv:
     # Splunk Web over TLS. Probes target 8089, not 8000, so this does not
     # affect health checking.
@@ -86,6 +92,10 @@ spec:
       - name: deployerLocalApps
         location: search-apps/
         scope: local
+      # authentication.conf must be identical on every member, so it goes
+      # through the deployer at cluster scope.
+      - name: samlAuth
+        location: saml-auth/
     volumes:
       - name: s3_apps
         storageType: s3
