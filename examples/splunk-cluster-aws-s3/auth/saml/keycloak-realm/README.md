@@ -31,16 +31,28 @@ Realm isolation does not help here — everyone is legitimately in the realm.
 
 ## Fixing it: a role plus a deny flow bound to the Splunk client
 
-1. Create a realm role, e.g. `splunk-access`, and assign it to the group that
-   should have Splunk (typically the same groups you map in `[roleMap_SAML]`).
+1. Create three realm roles. `s4k_hs_access` is a marker nobody is assigned
+   directly; `s4k_hs_admin` and `s4k_hs_user` are **composite** roles that
+   include it:
+
+   | Role | Composite of | Assign to people? |
+   |---|---|---|
+   | `s4k_hs_access` | — | No, marker only |
+   | `s4k_hs_admin` | `s4k_hs_access` | Yes |
+   | `s4k_hs_user` | `s4k_hs_access` | Yes |
+
+   Granting either real role therefore grants access implicitly, and the deny
+   condition has a single role to test instead of enumerating every role that
+   should be allowed. Add a third Splunk role later and you make it composite
+   of `s4k_hs_access` too — the flow needs no change.
 
 2. Authentication → Flows → duplicate `browser` → name it `splunk-browser`.
    Inside it add a **conditional sub-flow**:
 
-   - **Condition - user role** → role `splunk-access`, **Negate output: ON**
+   - **Condition - user role** → role `s4k_hs_access`, **Negate output: ON**
    - **Deny Access** (Required)
 
-   Reads as: *if the user does NOT have `splunk-access`, deny*. Everything else
+   Reads as: *if the user has neither Splunk role, deny*. Everything else
    in the copied flow — including your X509 step — runs unchanged.
 
    If your Keycloak version does not expose *Negate output* on the role
@@ -48,7 +60,7 @@ Realm isolation does not help here — everyone is legitimately in the realm.
    holding the role, and leave Deny Access as the terminal step.
 
 3. Bind the flow **to the Splunk client only**:
-   Clients → `splunk-shc` → Advanced → **Authentication flow overrides** →
+   Clients → `splunk-hs` → Advanced → **Authentication flow overrides** →
    Browser Flow = `splunk-browser`.
 
    This is the important step. Editing the realm's default browser flow would
@@ -78,7 +90,9 @@ external IdP or another realm, users originating there become realm users and
 inherit the same default: they can reach every client. Whatever gate you build
 must be a role the brokered users do not get automatically — check your
 first-login flow and any role mappers on the identity provider, which can grant
-roles on account creation.
+roles on account creation. `s4k_hs_access` being composite-only helps here:
+a broker would have to grant one of the two real roles, not a marker it might
+hand out generically.
 
 **Organizations, if you are on Keycloak 26+,** offer a membership boundary
 inside a realm that can be cleaner than roles for multi-tenant cases. The role
@@ -87,13 +101,14 @@ already using Organizations.
 
 ## Verifying
 
-Test with a user who is in the realm but lacks `splunk-access`. The correct
+Test with a user who is in the realm but has neither `s4k_hs_admin` nor
+`s4k_hs_user`. The correct
 result is rejection **at Keycloak**, before any redirect back to Splunk — you
 should never reach `/saml/acs`. If you land on a Splunk error page instead, the
 flow override did not bind and you are relying on Splunk's role mapping.
 
 ```bash
-# Splunk-side: confirm only intended groups map to roles
+# Splunk-side: confirm only the two intended roles map
 kubectl -n splunk exec splunk-shc-search-head-0 -- \
   /opt/splunk/bin/splunk btool authentication list roleMap_SAML --debug
 ```

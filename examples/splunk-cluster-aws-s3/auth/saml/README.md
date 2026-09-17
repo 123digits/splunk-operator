@@ -31,7 +31,7 @@ Create a **SAML** client in your realm:
 
 | Setting | Value |
 |---|---|
-| Client ID | `splunk-shc` (must equal `entityId` in authentication.conf) |
+| Client ID | `splunk-hs` (must equal `entityId` in authentication.conf) |
 | Valid redirect URIs | `https://splunk.example.com/*` |
 | Master SAML Processing URL | `https://splunk.example.com/saml/acs` |
 | Name ID format | `username` or `email` |
@@ -44,7 +44,7 @@ is not in the assertion, the user logs in with no roles and sees nothing.
 Grab the realm signing certificate from:
 
 ```
-https://keycloak.example.com/realms/splunk/protocol/saml/descriptor
+https://keycloak.example.com/realms/jcsc-oauth/protocol/saml/descriptor
 ```
 
 Extract the `<ds:X509Certificate>` value, wrap it in PEM headers, and load it:

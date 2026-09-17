@@ -51,9 +51,8 @@ data:
       # instead - see ../../scripted/README.md.
       map $ssl_client_s_dn $client_groups {
         default                "";
-        "~OU=Splunk Admins"    "splunk-admins";
-        "~OU=Splunk Power"     "splunk-power-users";
-        "~OU=Splunk Users"     "splunk-users";
+        "~OU=Splunk Admins"    "s4k_hs_admin";
+        "~OU=Splunk Users"     "s4k_hs_user";
       }
 
       # Issuer allow-list. ssl_client_certificate may hold several CAs, and

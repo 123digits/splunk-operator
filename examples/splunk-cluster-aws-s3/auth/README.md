@@ -1,7 +1,13 @@
 # User authentication
 
-Two working ways to log a person into Splunk with a client certificate. Both are
-built here; they suit different constraints.
+**Chosen path: SAML with Keycloak** (`saml/`). Certificates are validated by
+Keycloak, which issues a signed assertion to Splunk.
+
+`splunk-sso/nginx/` (ProxySSO with an nginx sidecar) and `scripted/` remain as
+documented alternatives with their trade-offs recorded. They are not part of the
+deployment — nothing in the numbered manifests references them. `oauth2/` is
+**not** an alternative: it is bearer-token validation for API clients and runs
+alongside SAML.
 
 **Neither involves Splunk reading the certificate.** Verified against the 10.4
 `authentication.conf` reference: there is no x509 or client-certificate user
@@ -28,20 +34,19 @@ SAML path map the same Keycloak realm roles to the same Splunk roles.
 | Trust boundary | Signed assertion | The pod's network namespace |
 | Auth method changes later | Reconfigure Keycloak, Splunk untouched | Rewrite the nginx layer |
 
-## Which to choose
+## Why SAML was chosen
 
-**Keycloak SAML** if you already run Keycloak, want live revocation checking, or
-expect to change authentication methods later — the assertion is signed, so the
-trust does not depend on network position, and swapping certs for WebAuthn or
-OTP leaves Splunk's config alone.
+The assertion is signed, so trust does not depend on network position. Keycloak
+can do live OCSP revocation, where the nginx path is limited to a CRL file on a
+refresh timer. And changing authentication method later — certificates to
+WebAuthn or OTP — is a Keycloak change with no Splunk edits at all.
 
-**nginx sidecar SSO** if you want no IdP dependency in the login path and are
-comfortable that revocation is CRL-on-a-timer. The loopback design makes the
-header trustworthy in a way a shared reverse proxy never is.
+## Setting it up
 
-They are not mutually exclusive — `SSOMode = permissive` plus SAML is a valid
-migration path, though running both in production means two things can grant
-access and both need auditing.
+1. `saml/keycloak-realm/` — realm roles and the gate that denies everyone else
+2. `saml/` — the Splunk app, and the Keycloak SAML client
+3. `saml/keycloak-x509/` — certificate login, validated at Keycloak
+4. `oauth2/` — optional, for API clients using Keycloak JWTs
 
 ## Realm and roles used throughout
 

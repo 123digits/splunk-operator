@@ -1,6 +1,13 @@
 {
   "_comment": [
-    "Partial realm import for the splunk-access gate described in README.md.",
+    "Partial realm import for realm jcsc-oauth: the two Splunk roles plus the",
+    "gate that denies everyone else.",
+    "",
+    "s4k_hs_access is a marker role. s4k_hs_admin and s4k_hs_user are COMPOSITE",
+    "roles that include it, so granting either automatically grants access and",
+    "there is only one role for the deny condition to test. Nobody is assigned",
+    "s4k_hs_access directly.",
+    "",
     "Apply with: Realm Settings -> Action -> Partial import, or via",
     "keycloak-config-cli / the Keycloak Operator's KeycloakRealmImport CRD.",
     "",
@@ -9,14 +16,34 @@
     "realm first and compare against a UI-built flow before trusting it.",
     "",
     "This grants nothing by itself. After importing you must still bind the",
-    "flow to the Splunk client: Clients -> splunk-shc -> Advanced ->",
+    "flow to the Splunk client: Clients -> splunk-hs -> Advanced ->",
     "Authentication flow overrides -> Browser Flow = splunk-browser."
   ],
   "roles": {
     "realm": [
       {
-        "name": "splunk-access",
-        "description": "Permits login to the Splunk SAML client. Assign to groups that should reach Splunk."
+        "name": "s4k_hs_access",
+        "description": "Marker role gating login to the splunk-hs client. Do not assign directly; granted via the composite roles below."
+      },
+      {
+        "name": "s4k_hs_admin",
+        "description": "Splunk administrators. Maps to the Splunk admin role.",
+        "composite": true,
+        "composites": {
+          "realm": [
+            "s4k_hs_access"
+          ]
+        }
+      },
+      {
+        "name": "s4k_hs_user",
+        "description": "Standard Splunk users. Maps to the Splunk user role.",
+        "composite": true,
+        "composites": {
+          "realm": [
+            "s4k_hs_access"
+          ]
+        }
       }
     ]
   },
@@ -104,14 +131,14 @@
     {
       "alias": "splunk-access-negated",
       "config": {
-        "condition.user.role": "splunk-access",
+        "condition.user.role": "s4k_hs_access",
         "negate": "true"
       }
     },
     {
       "alias": "splunk-access-denied-message",
       "config": {
-        "error_message": "Your account is not authorized for Splunk. Request the splunk-access role."
+        "error_message": "Your account is not authorized for Splunk. Request the s4k_hs_admin or s4k_hs_user role."
       }
     }
   ]
