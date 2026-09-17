@@ -115,7 +115,7 @@ data means a search over old data rejects irrelevant buckets without faulting
 them down from S3 at all.
 
 **Operator gotcha:** the operator only writes a `[cachemanager]` setting when it
-is **non-zero** — see `getSmartstoreServerConf` in
+is **non-zero** — see `GetServerConfigEntries` in
 `pkg/splunk/enterprise/configuration.go`. So setting `maxCacheSize: 0` in the CR
 does **not** write `max_cache_size = 0`; it writes nothing and leaves Splunk's
 built-in default in force. If you need the value set explicitly, confirm what
