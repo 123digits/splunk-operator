@@ -121,6 +121,15 @@ user can reach every client, so being in the realm is not by itself a
 restriction. `keycloak-realm/` adds a role-gated deny flow bound to the Splunk
 client only.
 
+## Roles
+
+`splunk_saml_app/default/authorize.conf` defines `s4k_hs_user` from scratch
+rather than importing the built-in `user` role, which is **not** read-only — it
+can create knowledge objects and schedule searches. Building up avoids a Splunk
+upgrade silently widening an inherited role.
+
+`s4k_hs_admin` maps onto the built-in `admin` role, so it needs no definition.
+
 ## Certificate-based login
 
 If users carry client certificates, the certificate is validated by **Keycloak**,

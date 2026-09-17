@@ -12,13 +12,10 @@ exactly `Splunk`, `LDAP`, `Scripted`, `SAML` and `ProxySSO`.
 So the certificate is always validated by something in front, which then tells
 Splunk who the user is.
 
-Splunk 10.x does validate external OAuth2 JWTs under
-`[oauth2_external_config_<issuer>]`, with `jwks_uri`, `audience`, `issuer` and a
-`groupsClaim` mapped through `[oauth2_external_role_mapping_<issuer>]`. That is
-worth knowing for **API clients** — a service can present a Keycloak-issued JWT
-instead of a Splunk token — but it is bearer-token validation for third-party
-applications, not an interactive login flow, so it does not replace either
-option below.
+Splunk 10.x does validate external OAuth2 JWTs — see `oauth2/`. That is
+bearer-token access for **API clients**, with no redirect flow of any kind, so
+it complements the options below rather than replacing them. Both it and the
+SAML path map the same Keycloak realm roles to the same Splunk roles.
 
 | | `saml/keycloak-x509/` | `splunk-sso/nginx/` |
 |---|---|---|
@@ -45,6 +42,19 @@ header trustworthy in a way a shared reverse proxy never is.
 They are not mutually exclusive — `SSOMode = permissive` plus SAML is a valid
 migration path, though running both in production means two things can grant
 access and both need auditing.
+
+## Realm and roles used throughout
+
+| | |
+|---|---|
+| Keycloak realm | `jcsc-oauth` |
+| Client | `splunk-hs` |
+| Admin | realm role `s4k_hs_admin` -> Splunk `admin` |
+| Read-only | realm role `s4k_hs_user` -> Splunk `s4k_hs_user` |
+
+`s4k_hs_user` is defined in `saml/splunk_saml_app/default/authorize.conf`,
+built from scratch rather than importing the built-in `user` role, which can
+create knowledge objects and schedule searches and so is not read-only.
 
 ## What is shared regardless
 
