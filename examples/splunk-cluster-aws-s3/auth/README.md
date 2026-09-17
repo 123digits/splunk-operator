@@ -16,6 +16,7 @@ who the user is.
 | Extra infrastructure | Keycloak realm | Kyverno (for sidecar injection) |
 | Revocation | CRL **and** OCSP | CRL only, needs refresh automation |
 | Roles | From IdP group attributes | Assigned in Splunk (LDAP or native) |
+| Restricting who may log in | Role-gated deny flow per client (`saml/keycloak-realm/`) | Any CN your user CA signs — scope via the CA itself |
 | Trust boundary | Signed assertion | The pod's network namespace |
 | Auth method changes later | Reconfigure Keycloak, Splunk untouched | Rewrite the nginx layer |
 

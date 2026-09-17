@@ -113,6 +113,14 @@ hostnames. Either register a Keycloak client per host, or leave them on local
 admin auth and reach them by port-forward — for two operator-facing UIs that is
 often the saner trade.
 
+## Restricting who can log in
+
+Realm isolation is automatic — a user in another realm cannot authenticate to
+this client at all. But **within** the realm, Keycloak's default is that every
+user can reach every client, so being in the realm is not by itself a
+restriction. `keycloak-realm/` adds a role-gated deny flow bound to the Splunk
+client only.
+
 ## Certificate-based login
 
 If users carry client certificates, the certificate is validated by **Keycloak**,

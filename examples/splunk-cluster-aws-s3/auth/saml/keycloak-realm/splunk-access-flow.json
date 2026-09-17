@@ -1,0 +1,118 @@
+{
+  "_comment": [
+    "Partial realm import for the splunk-access gate described in README.md.",
+    "Apply with: Realm Settings -> Action -> Partial import, or via",
+    "keycloak-config-cli / the Keycloak Operator's KeycloakRealmImport CRD.",
+    "",
+    "Authenticator provider IDs and config key names are stable across recent",
+    "Keycloak but are NOT guaranteed across major versions. Import into a test",
+    "realm first and compare against a UI-built flow before trusting it.",
+    "",
+    "This grants nothing by itself. After importing you must still bind the",
+    "flow to the Splunk client: Clients -> splunk-shc -> Advanced ->",
+    "Authentication flow overrides -> Browser Flow = splunk-browser."
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "splunk-access",
+        "description": "Permits login to the Splunk SAML client. Assign to groups that should reach Splunk."
+      }
+    ]
+  },
+  "authenticationFlows": [
+    {
+      "alias": "splunk-browser",
+      "description": "Browser flow for the Splunk SAML client: denies users lacking splunk-access",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "auth-cookie",
+          "requirement": "ALTERNATIVE",
+          "priority": 10,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false
+        },
+        {
+          "flowAlias": "splunk-browser-forms",
+          "requirement": "ALTERNATIVE",
+          "priority": 20,
+          "userSetupAllowed": false,
+          "autheticatorFlow": true
+        },
+        {
+          "flowAlias": "splunk-browser-authz",
+          "requirement": "REQUIRED",
+          "priority": 30,
+          "userSetupAllowed": false,
+          "autheticatorFlow": true
+        }
+      ]
+    },
+    {
+      "alias": "splunk-browser-forms",
+      "description": "Certificate authentication. Swap x509 for the form authenticator if not using client certs.",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "auth-x509-client-username-form",
+          "requirement": "ALTERNATIVE",
+          "priority": 10,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false
+        },
+        {
+          "authenticator": "auth-username-password-form",
+          "requirement": "ALTERNATIVE",
+          "priority": 20,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false
+        }
+      ]
+    },
+    {
+      "alias": "splunk-browser-authz",
+      "description": "Conditional deny: runs only when the user lacks splunk-access",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "conditional-user-role",
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false,
+          "authenticatorConfig": "splunk-access-negated"
+        },
+        {
+          "authenticator": "deny-access-authenticator",
+          "requirement": "REQUIRED",
+          "priority": 20,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false,
+          "authenticatorConfig": "splunk-access-denied-message"
+        }
+      ]
+    }
+  ],
+  "authenticatorConfig": [
+    {
+      "alias": "splunk-access-negated",
+      "config": {
+        "condition.user.role": "splunk-access",
+        "negate": "true"
+      }
+    },
+    {
+      "alias": "splunk-access-denied-message",
+      "config": {
+        "error_message": "Your account is not authorized for Splunk. Request the splunk-access role."
+      }
+    }
+  ]
+}
