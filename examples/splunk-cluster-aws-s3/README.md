@@ -510,6 +510,10 @@ Keycloak speaks SAML natively alongside OIDC, so `saml/` configures Splunk
 against it directly rather than bridging through oauth2-proxy and a
 trusted-header scheme, which would be a header-spoofing exposure.
 
+If your users carry client certificates, `saml/keycloak-x509/` wires those in —
+Keycloak validates the certificate and issues the assertion, so Splunk's own
+configuration does not change and only the Keycloak hostname prompts for a cert.
+
 Whatever you choose, **leave the local `admin` account working** — the operator
 authenticates as `admin` with the password from `splunk-<ns>-secret` to push
 bundles and manage the cluster.

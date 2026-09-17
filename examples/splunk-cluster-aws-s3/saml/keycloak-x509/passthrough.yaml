@@ -1,0 +1,30 @@
+# ALTERNATIVE to traefik-mtls.yaml: TLS passthrough so KEYCLOAK itself performs
+# the mTLS handshake.
+#
+# Fewer moving parts and no header-format negotiation - Keycloak gets the real
+# certificate from its own TLS stack rather than a reconstructed PEM string.
+# Prefer this unless you need Traefik to do HTTP-level routing for Keycloak.
+#
+# Trade-off: raw TCP, so Traefik cannot route by path, add middlewares, or
+# terminate for this host. Keycloak owns the public certificate too.
+#
+# Keycloak container settings for this mode:
+#   KC_HTTPS_CLIENT_AUTH=request      # 'request' = optional, 'required' = mandatory
+#   KC_TRUSTSTORE_PATHS=/opt/keycloak/conf/truststores
+# with your user PKI CA mounted into that truststore directory.
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: keycloak-passthrough
+  namespace: keycloak
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: HostSNI(`keycloak.example.com`)
+      services:
+        - name: keycloak
+          port: 8443
+  tls:
+    passthrough: true

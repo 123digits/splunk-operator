@@ -1,0 +1,73 @@
+# Client-certificate login: Traefik-terminated mTLS in front of KEYCLOAK.
+#
+# Note what this does NOT touch: the Splunk routes. The browser presents its
+# certificate to Keycloak's hostname only. Splunk never sees the cert and needs
+# no changes - it just consumes the SAML assertion Keycloak produces. That also
+# means users are not prompted for a certificate when hitting Splunk directly.
+#
+# This is the "header" approach. See passthrough.yaml for the alternative and
+# README.md for which to pick - the header format is the fiddly part.
+---
+# Makes Traefik REQUEST and VERIFY a client cert on this endpoint.
+# RequireAndVerifyClientCert: no valid cert, no connection. Use
+# VerifyClientCertIfGiven only if you need a password fallback on the same host.
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata:
+  name: keycloak-mtls
+  namespace: keycloak
+spec:
+  minVersion: VersionTLS12
+  clientAuth:
+    # Secret(s) holding the CA that signed your USER certificates. This is your
+    # corporate/smartcard PKI - NOT the cert-manager internal CA from ../tls,
+    # which signs server certs for pod-to-pod traffic. Different trust domain,
+    # deliberately: an internal service cert must never authenticate a human.
+    secretNames:
+      - user-pki-ca
+    clientAuthType: RequireAndVerifyClientCert
+---
+# Forwards the verified client cert to Keycloak as a header.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: keycloak-client-cert
+  namespace: keycloak
+spec:
+  passTLSClientCert:
+    pem: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`keycloak.example.com`)
+      middlewares:
+        - name: keycloak-client-cert
+      services:
+        - name: keycloak
+          port: 8443
+          scheme: https
+          serversTransport: keycloak-backend
+  tls:
+    secretName: keycloak-public-tls
+    options:
+      name: keycloak-mtls
+      namespace: keycloak
+---
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: keycloak-backend
+  namespace: keycloak
+spec:
+  serverName: keycloak.keycloak.svc
+  rootCAsSecrets:
+    - splunk-internal-ca
+  insecureSkipVerify: false

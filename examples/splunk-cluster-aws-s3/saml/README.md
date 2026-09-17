@@ -113,6 +113,12 @@ hostnames. Either register a Keycloak client per host, or leave them on local
 admin auth and reach them by port-forward — for two operator-facing UIs that is
 often the saner trade.
 
+## Certificate-based login
+
+If users carry client certificates, the certificate is validated by **Keycloak**,
+not by Splunk and not on the Splunk route — Splunk's config here is unchanged.
+See `keycloak-x509/`.
+
 ## Verifying
 
 ```bash
