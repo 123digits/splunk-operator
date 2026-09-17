@@ -1,0 +1,31 @@
+# Tells Traefik how to verify the Splunk backends it re-encrypts to.
+#
+# This is the piece people skip. Without a ServersTransport, Traefik talks
+# HTTPS to the backend but does NOT verify it - the connection is encrypted and
+# unauthenticated, which is the same failure as curl --insecure, just moved.
+#
+# rootCAsSecrets makes Traefik validate the backend cert against our internal
+# CA; serverName makes it check the identity rather than just the chain.
+---
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: splunk-searchhead
+  namespace: splunk
+spec:
+  serverName: splunk-shc-search-head-service.splunk.svc
+  rootCAsSecrets:
+    - splunk-internal-ca
+  # NEVER set insecureSkipVerify: true here. It is the whole point of this file.
+  insecureSkipVerify: false
+---
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: splunk-managers
+  namespace: splunk
+spec:
+  serverName: splunk-mc-monitoring-console-service.splunk.svc
+  rootCAsSecrets:
+    - splunk-internal-ca
+  insecureSkipVerify: false

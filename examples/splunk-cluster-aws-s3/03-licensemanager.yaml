@@ -9,12 +9,23 @@ metadata:
   finalizers:
   - enterprise.splunk.com/delete-pvc
 spec:
-  image: splunk/splunk:10.2.0
-  # Mounts the ConfigMap at /mnt/licenses
+  # cert-manager secret mounted at /mnt/splunk-tls (operator mounts custom
+  # volumes at /mnt/<name> in every container). tls-combined.pem is the
+  # key+cert file Splunk's serverCert wants; ca.crt is what the verifying
+  # probes and peer checks validate against.
   volumes:
+    - name: splunk-tls
+      secret:
+        secretName: splunk-manager-tls
+        defaultMode: 0400
     - name: licenses
       configMap:
         name: splunk-licenses
+  extraEnv:
+    - name: SPLUNK_TLS_CA_PATH
+      value: /mnt/splunk-tls/ca.crt
+  image: splunk/splunk:10.2.0
+  # Mounts the ConfigMap at /mnt/licenses
   licenseUrl: /mnt/licenses/enterprise.lic
   # Send the LM's own internal logs into the indexer cluster.
   clusterManagerRef:

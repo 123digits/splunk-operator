@@ -8,6 +8,27 @@ metadata:
   finalizers:
   - enterprise.splunk.com/delete-pvc
 spec:
+  # cert-manager secret mounted at /mnt/splunk-tls (operator mounts custom
+  # volumes at /mnt/<name> in every container). tls-combined.pem is the
+  # key+cert file Splunk's serverCert wants; ca.crt is what the verifying
+  # probes and peer checks validate against.
+  volumes:
+    - name: splunk-tls
+      secret:
+        secretName: splunk-manager-tls
+        defaultMode: 0400
+    - name: splunk-public-tls
+      secret:
+        secretName: splunk-public-tls
+        defaultMode: 0400
+  extraEnv:
+    # Splunk Web over TLS. Probes target 8089, not 8000, so this does not
+    # affect health checking.
+    - name: SPLUNK_HTTP_ENABLESSL
+      value: "true"
+    # Consumed by the verifying probe scripts in tls/probes/.
+    - name: SPLUNK_TLS_CA_PATH
+      value: /mnt/splunk-tls/ca.crt
   image: splunk/splunk:10.2.0
   licenseManagerRef:
     name: lm

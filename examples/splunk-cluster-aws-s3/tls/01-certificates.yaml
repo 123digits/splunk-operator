@@ -1,0 +1,138 @@
+# Per-tier certificates.
+#
+# additionalOutputFormats: CombinedPEM is the important part. Splunk's
+# server.conf serverCert wants ONE file containing private key + certificate;
+# cert-manager's default tls.crt/tls.key split does not satisfy it. CombinedPEM
+# adds tls-combined.pem in the same secret, which is exactly that file.
+#
+# This requires the AdditionalCertificateOutputFormats feature gate on both the
+# cert-manager controller and webhook. It is GA in recent cert-manager, but on
+# older installs you must enable it explicitly:
+#   --feature-gates=AdditionalCertificateOutputFormats=true
+# If tls-combined.pem is missing from the secret, that gate is why. Without it
+# you must concatenate key+cert yourself and mount it as your own secret.
+#
+# dnsNames cover the operator's service naming (splunk-<cr>-<type>-service) plus
+# the per-pod names from the headless service, which is what peers actually
+# connect to. Get these wrong and sslVerifyServerCert fails on hostname
+# mismatch even though the chain is valid.
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-indexer-tls
+  namespace: splunk
+spec:
+  secretName: splunk-indexer-tls
+  duration: 2160h     # 90d
+  renewBefore: 360h   # 15d
+  issuerRef:
+    name: splunk-internal
+    kind: Issuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1   # Splunk expects traditional RSA PEM, not PKCS8
+  additionalOutputFormats:
+    - type: CombinedPEM
+  commonName: splunk-idxc-indexer
+  ipAddresses:
+    - 127.0.0.1
+  dnsNames:
+    - localhost
+    - splunk-idxc-indexer-service
+    - splunk-idxc-indexer-service.splunk.svc
+    - splunk-idxc-indexer-service.splunk.svc.cluster.local
+    - splunk-idxc-indexer-headless
+    - splunk-idxc-indexer-headless.splunk.svc
+    - "*.splunk-idxc-indexer-headless.splunk.svc"
+    - "*.splunk-idxc-indexer-headless.splunk.svc.cluster.local"
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-searchhead-tls
+  namespace: splunk
+spec:
+  secretName: splunk-searchhead-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: splunk-internal
+    kind: Issuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1
+  additionalOutputFormats:
+    - type: CombinedPEM
+  commonName: splunk-shc-search-head
+  ipAddresses:
+    - 127.0.0.1
+  dnsNames:
+    - localhost
+    - splunk-shc-search-head-service
+    - splunk-shc-search-head-service.splunk.svc
+    - splunk-shc-search-head-service.splunk.svc.cluster.local
+    - splunk-shc-search-head-headless
+    - "*.splunk-shc-search-head-headless.splunk.svc"
+    - "*.splunk-shc-search-head-headless.splunk.svc.cluster.local"
+    - splunk-shc-deployer-service
+    - splunk-shc-deployer-service.splunk.svc
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-manager-tls
+  namespace: splunk
+spec:
+  secretName: splunk-manager-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: splunk-internal
+    kind: Issuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1
+  additionalOutputFormats:
+    - type: CombinedPEM
+  commonName: splunk-managers
+  ipAddresses:
+    - 127.0.0.1
+  dnsNames:
+    - localhost
+    - splunk-cm-cluster-manager-service
+    - splunk-cm-cluster-manager-service.splunk.svc
+    - splunk-cm-cluster-manager-service.splunk.svc.cluster.local
+    - splunk-lm-license-manager-service
+    - splunk-lm-license-manager-service.splunk.svc
+    - splunk-mc-monitoring-console-service
+    - splunk-mc-monitoring-console-service.splunk.svc
+---
+# Browser-trusted cert for the hostnames Traefik serves. Consumed by Traefik,
+# NOT mounted into Splunk - unless you use TLS passthrough for Splunk Web, in
+# which case Splunk itself must present this cert. See traefik/README.md.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-public-tls
+  namespace: splunk
+spec:
+  secretName: splunk-public-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: letsencrypt
+    kind: Issuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1
+  additionalOutputFormats:
+    - type: CombinedPEM
+  dnsNames:
+    - splunk.example.com
+    - mc.splunk.example.com
+    - cm.splunk.example.com

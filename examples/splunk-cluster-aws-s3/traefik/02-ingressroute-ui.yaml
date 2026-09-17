@@ -1,0 +1,75 @@
+# Splunk Web UIs via Traefik, TLS terminated at the edge and RE-ENCRYPTED to
+# the pods. Traffic is never in plaintext, and both legs are authenticated:
+# the browser verifies the public cert, Traefik verifies the backend against
+# our internal CA (see 01-serverstransport.yaml).
+#
+# Why this model rather than TLS passthrough: passthrough is pure TCP, so
+# Traefik cannot set a cookie, and Splunk Web on a 3-member search head cluster
+# NEEDS session stickiness. Round-robining a logged-in session across members
+# gives users random logouts and blank pages. See traefik/README.md for the
+# passthrough variant and when it is the right call.
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunk-web
+  namespace: splunk
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`splunk.example.com`)
+      services:
+        - name: splunk-shc-search-head-service
+          port: 8000
+          scheme: https
+          serversTransport: splunk-searchhead
+          # Required for Splunk Web across SHC members.
+          sticky:
+            cookie:
+              name: splunk_sh
+              secure: true
+              httpOnly: true
+              sameSite: lax
+  tls:
+    secretName: splunk-public-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunk-mc
+  namespace: splunk
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`mc.splunk.example.com`)
+      services:
+        - name: splunk-mc-monitoring-console-service
+          port: 8000
+          scheme: https
+          serversTransport: splunk-managers
+  tls:
+    secretName: splunk-public-tls
+---
+# Cluster Manager UI. Single pod, so no stickiness needed.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunk-cm
+  namespace: splunk
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`cm.splunk.example.com`)
+      services:
+        - name: splunk-cm-cluster-manager-service
+          port: 8000
+          scheme: https
+          serversTransport: splunk-managers
+  tls:
+    secretName: splunk-public-tls

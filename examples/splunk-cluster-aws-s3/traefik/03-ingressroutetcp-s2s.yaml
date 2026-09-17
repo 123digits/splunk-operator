@@ -1,0 +1,67 @@
+# Forwarder ingest (S2S 9997) and HEC (8088) through Traefik.
+#
+# S2S is not HTTP, so it must be IngressRouteTCP. TLS is PASSTHROUGH here, and
+# that is correct: the indexers require a client certificate
+# (requireClientCert = true in inputs.conf), and mutual TLS cannot survive edge
+# termination - Traefik would become the client and the indexer would
+# authenticate Traefik rather than the forwarder. Passthrough keeps the
+# forwarder's identity intact end to end.
+#
+# This requires a dedicated entrypoint on port 9997 in your Traefik static
+# config, e.g.:
+#   entryPoints:
+#     splunk-s2s:
+#       address: ":9997"
+#
+# HostSNI requires the forwarder to send SNI. Splunk forwarders do when
+# configured with a server name; if yours do not, use HostSNI(`*`) on a
+# dedicated entrypoint, which matches any connection on that port.
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: splunk-s2s
+  namespace: splunk
+spec:
+  entryPoints:
+    - splunk-s2s
+  routes:
+    - match: HostSNI(`ingest.splunk.example.com`)
+      services:
+        - name: splunk-idxc-indexer-service
+          port: 9997
+  tls:
+    passthrough: true
+---
+# HEC is HTTP, so it can be an ordinary IngressRoute with re-encryption.
+# Terminating here is acceptable because HEC authenticates with a bearer token
+# rather than a client certificate, so no peer identity is lost.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunk-hec
+  namespace: splunk
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`hec.splunk.example.com`) && PathPrefix(`/services/collector`)
+      services:
+        - name: splunk-idxc-indexer-service
+          port: 8088
+          scheme: https
+          serversTransport: splunk-indexer-hec
+  tls:
+    secretName: splunk-public-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: splunk-indexer-hec
+  namespace: splunk
+spec:
+  serverName: splunk-idxc-indexer-service.splunk.svc
+  rootCAsSecrets:
+    - splunk-internal-ca
+  insecureSkipVerify: false

@@ -467,3 +467,35 @@ per AZ pointing at a shared `ClusterManager`, each with a hardcoded `site` and z
 affinity. See `docs/MultisiteExamples.md`. The single-site C3 here relies on
 `topologySpreadConstraints` for AZ spread, which gives you scheduling spread but not
 site-aware bucket placement.
+
+---
+
+## 10. TLS and external access
+
+Two directories cover this, each with its own README:
+
+- **`tls/`** — cert-manager issuers and per-tier certificates, a Splunk conf app
+  that turns on peer verification, and replacement health-probe scripts.
+- **`traefik/`** — IngressRoute / IngressRouteTCP for the UIs, forwarder ingest
+  and HEC.
+
+Three things worth knowing before you read them:
+
+**Every pod has a UI.** The operator gives port 8000 to every instance type, so
+all 9 pods serve Splunk Web. Only three are worth exposing — search heads,
+monitoring console, cluster manager. Port-forward the rest.
+
+**splunkd is already TLS, and that is not as good as it sounds.** Port 8089 uses
+Splunk's shipped certificates, whose private keys are in every Splunk
+distribution. Verification against that CA proves nothing. Replacing it is the
+point of `tls/`.
+
+**`sslVerifyServerCert` alone is not authentication.** It checks that the peer's
+cert chains to your CA, not that the peer is who you dialled. Pair it with
+`sslVerifyServerName` (or `sslCommonNameToCheck` on the forwarding side) or any
+cert your CA ever issued will be accepted from any host.
+
+The operator's own probe scripts use `curl --insecure`. `tls/probes/` replaces
+all three with versions that validate against the internal CA and fail closed.
+Install the ConfigMap **before the first CR in the namespace** — the operator
+creates it with defaults if absent and never overwrites it afterwards.

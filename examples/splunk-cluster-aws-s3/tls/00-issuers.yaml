@@ -1,0 +1,72 @@
+# cert-manager issuers.
+#
+# TWO separate trust domains, deliberately:
+#
+#   internal  - a private CA whose certs secure Splunk-to-Splunk traffic
+#               (splunkd 8089, S2S 9997, index replication 9887). Nothing
+#               outside the cluster validates these, so a private CA is right
+#               and avoids burning public cert quota on pod churn.
+#
+#   public    - a real, browser-trusted cert for the UI hostnames that users
+#               and forwarders outside the cluster hit through Traefik.
+---
+# Bootstrap: a self-signed issuer used only to mint the internal CA below.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned-bootstrap
+  namespace: splunk
+spec:
+  selfSigned: {}
+---
+# The internal CA certificate itself. Long-lived; rotating it means restarting
+# every Splunk pod, so treat it as infrastructure.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-internal-ca
+  namespace: splunk
+spec:
+  isCA: true
+  commonName: splunk-internal-ca
+  secretName: splunk-internal-ca
+  duration: 43800h    # 5 years
+  renewBefore: 8760h  # 1 year
+  privateKey:
+    algorithm: RSA
+    size: 4096
+  issuerRef:
+    name: selfsigned-bootstrap
+    kind: Issuer
+---
+# Issues the per-tier certs from the CA above.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: splunk-internal
+  namespace: splunk
+spec:
+  ca:
+    secretName: splunk-internal-ca
+---
+# Public issuer for UI hostnames. DNS-01 shown because Splunk Web sits behind
+# TLS passthrough, so HTTP-01 cannot be solved through Traefik for that host.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt
+  namespace: splunk
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: platform@example.com
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - dns01:
+          route53:
+            region: us-east-1
+            # With kiam, annotate the cert-manager pod for a role allowing
+            # route53:ChangeResourceRecordSets on the hosted zone, exactly as
+            # the Splunk pods are annotated. IRSA fields would not apply here.
+            hostedZoneID: <HOSTED_ZONE_ID>
