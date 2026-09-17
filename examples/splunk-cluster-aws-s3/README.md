@@ -162,38 +162,23 @@ kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic
 
 ---
 
-## 3. Why you still need EBS even though SmartStore writes to S3
+## 3. Storage — why EBS is still required with SmartStore
 
-SmartStore does not replace local disk — it changes what local disk is *for*. Every
-Splunk pod gets two PVCs, and both are still required with SmartStore enabled:
+SmartStore does not replace local disk, it changes what local disk is *for*.
+Every pod still gets two EBS volumes:
 
-| Volume | Default | Holds | Does SmartStore remove it? |
+| Mount | Default | Holds | Removed by SmartStore? |
 |---|---|---|---|
-| `/opt/splunk/etc` | 10 GiB | Config, apps, user objects, dashboards | **No** — nothing about this lives in S3 |
-| `/opt/splunk/var` | 100 GiB | **Hot buckets**, SmartStore cache, splunkd logs, search artifacts | **No** — see below |
+| `/opt/splunk/etc` | 10Gi | Config, apps, dashboards | **No** — none of this is ever in S3 |
+| `/opt/splunk/var` | 100Gi | Hot buckets, SmartStore cache, logs | **No** — hot buckets are always local, and warm buckets are cached locally to be searched |
 
-Three reasons `/opt/splunk/var` cannot go away:
+What SmartStore changes is *sizing*: `/opt/splunk/var` holds the working set
+rather than the full retention period, which is why the indexers here ask for
+500Gi instead of multiple TB.
 
-1. **Hot buckets are always local.** Data lands on local disk first and stays there
-   while the bucket is open for writing. Only on roll to warm does it upload to S3.
-   Lose the volume with hot buckets and you lose data not yet uploaded — which is
-   exactly why index replication (RF ≥ 2) still matters with SmartStore.
-2. **Warm buckets are cached locally to be searched.** SmartStore fetches a bucket
-   from S3 into the local cache before searching it. The cache manager evicts by the
-   `hotlistRecencySecs` / eviction policy settings. Size `/opt/splunk/var` for your
-   working set, not your retention — that is the real saving: 500 GiB of cache
-   instead of 10 TiB of retention.
-3. **splunkd logs, the dispatch directory, and KV store** are local regardless.
-
-So the split is: **S3 = durable long-term retention; EBS = hot tier + cache.** The
-`storageCapacity` in these manifests reflects that — indexers get 500 GiB of `var`
-for cache and hot, not enough for full retention, because full retention is in S3.
-
-`ObjectStorage` (optional/) is a different thing entirely — it is the overflow bucket
-for oversized *ingestion queue messages*, not bucket storage. It does not replace
-SmartStore, and neither replaces EBS.
-
----
+**[STORAGE.md](STORAGE.md)** covers this properly — why each volume exists,
+per-tier sizing, the `WaitForFirstConsumer` zonal requirement, the `delete-pvc`
+finalizer, pre-provisioned PVs, and how to tell when the cache is undersized.
 
 ## 4. Getting your existing dashboards in
 
