@@ -41,6 +41,35 @@ data:
         "SUCCESS" "1";
       }
 
+      # Map the certificate OU to a group name for Splunk's ProxySSO role
+      # mapping. With a pure certificate flow the CA is the source of group
+      # membership, so whoever controls issuance controls authorization -
+      # make sure that is intended before relying on it.
+      #
+      # If your groups live in Keycloak rather than the certificate, this is the
+      # point where a script or an auth_request subrequest would be needed
+      # instead - see ../../scripted/README.md.
+      map $ssl_client_s_dn $client_groups {
+        default                "";
+        "~OU=Splunk Admins"    "splunk-admins";
+        "~OU=Splunk Power"     "splunk-power-users";
+        "~OU=Splunk Users"     "splunk-users";
+      }
+
+      # Issuer allow-list. ssl_client_certificate may hold several CAs, and
+      # ssl_verify_client accepts ANY of them - so if you trust more than one
+      # issuer, pin the acceptable ones explicitly here.
+      #
+      # This is where issuer checking belongs. Splunk's auth script never sees
+      # the certificate (see ../scripted/README.md), so a cert from an
+      # unwanted-but-trusted CA must be refused before Splunk is handed a
+      # username at all.
+      map $ssl_client_i_dn $issuer_ok {
+        default                                  "0";
+        "~^CN=Corp Issuing CA 1,(O=Corp|DC=corp)" "1";
+        "~^CN=Corp Smartcard CA,"                 "1";
+      }
+
       server {
         listen 8443 ssl;
         http2 on;
@@ -63,13 +92,24 @@ data:
         ssl_crl /etc/nginx/pki/user-ca.crl;
 
         location / {
-          if ($cert_ok = "0") { return 403 "client certificate required\n"; }
+          if ($cert_ok = "0")   { return 403 "client certificate required\n"; }
+          if ($issuer_ok = "0") { return 403 "certificate issuer not accepted\n"; }
           if ($client_cn = "")  { return 403 "no CN in client certificate\n"; }
 
           # THE critical line. proxy_set_header REPLACES any inbound header of
           # the same name, so a client cannot smuggle its own REMOTE_USER.
           # Never change this to add_header or make it conditional.
           proxy_set_header REMOTE_USER $client_cn;
+
+          # Informational only. Splunk's SSO reads REMOTE_USER and nothing else,
+          # so these do not influence authentication or roles - they are here so
+          # the full subject and issuer reach access logs for audit.
+          # Consumed by [roleMap_proxySSO]. Like REMOTE_USER this REPLACES any
+          # inbound value, so a client cannot supply its own group list.
+          proxy_set_header REMOTE_GROUPS $client_groups;
+
+          proxy_set_header X-Client-Subject-DN $ssl_client_s_dn;
+          proxy_set_header X-Client-Issuer-DN  $ssl_client_i_dn;
 
           # Strip anything else a client might use to impersonate.
           proxy_set_header X-Remote-User "";

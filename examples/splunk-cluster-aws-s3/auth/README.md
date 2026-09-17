@@ -3,11 +3,22 @@
 Two working ways to log a person into Splunk with a client certificate. Both are
 built here; they suit different constraints.
 
-**Neither involves Splunk reading the certificate.** Splunk Enterprise cannot
-map an X.509 certificate to a user — it has no OIDC relying party either. Its
-only options are native auth, LDAP, SAML 2.0, and header-based proxy SSO. So the
-certificate is always validated by something in front, which then tells Splunk
-who the user is.
+**Neither involves Splunk reading the certificate.** Verified against the 10.4
+`authentication.conf` reference: there is no x509 or client-certificate user
+authentication anywhere in it (the one `clientCert` setting is for Splunk's own
+outbound TLS to LDAP/SAML, not for authenticating people). `authType` accepts
+exactly `Splunk`, `LDAP`, `Scripted`, `SAML` and `ProxySSO`.
+
+So the certificate is always validated by something in front, which then tells
+Splunk who the user is.
+
+Splunk 10.x does validate external OAuth2 JWTs under
+`[oauth2_external_config_<issuer>]`, with `jwks_uri`, `audience`, `issuer` and a
+`groupsClaim` mapped through `[oauth2_external_role_mapping_<issuer>]`. That is
+worth knowing for **API clients** — a service can present a Keycloak-issued JWT
+instead of a Splunk token — but it is bearer-token validation for third-party
+applications, not an interactive login flow, so it does not replace either
+option below.
 
 | | `saml/keycloak-x509/` | `splunk-sso/nginx/` |
 |---|---|---|

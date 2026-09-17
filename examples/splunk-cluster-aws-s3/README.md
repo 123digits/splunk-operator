@@ -503,8 +503,11 @@ creates it with defaults if absent and never overwrites it afterwards.
 ## 11. User login
 
 Client certificates authenticate **machines**, not people — there is no x509
-user login for Splunk Web. And Splunk Enterprise has no native OIDC/OAuth
-relying party; its SSO story is **SAML 2.0**.
+user login for Splunk Web. For interactive login Splunk Enterprise has no OIDC
+relying party — `authType` accepts only `Splunk`, `LDAP`, `Scripted`, `SAML` and
+`ProxySSO`. (10.x *does* natively validate external OAuth2 JWTs under
+`[oauth2_external_config_<issuer>]`, but that is bearer-token access for
+third-party applications, not a browser login flow.)
 
 Two certificate-login paths are built under `auth/`: Keycloak SAML, and a
 proxy-SSO route where an nginx sidecar terminates mTLS and Splunk Web binds
