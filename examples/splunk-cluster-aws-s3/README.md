@@ -503,21 +503,14 @@ creates it with defaults if absent and never overwrites it afterwards.
 ## 11. User login
 
 Client certificates authenticate **machines**, not people — there is no x509
-user login for Splunk Web. For interactive login Splunk Enterprise has no OIDC
-relying party — `authType` accepts only `Splunk`, `LDAP`, `Scripted`, `SAML` and
-`ProxySSO`. (10.x *does* natively validate external OAuth2 JWTs under
-`[oauth2_external_config_<issuer>]`, but that is bearer-token access for
-third-party applications, not a browser login flow.)
+user login for Splunk Web, and no OIDC authorization-code flow either. Splunk's
+SSO story is **SAML 2.0**.
 
-Two certificate-login paths are built under `auth/`: Keycloak SAML, and a
-proxy-SSO route where an nginx sidecar terminates mTLS and Splunk Web binds
-loopback only. `auth/README.md` compares them. Note the operator has no sidecar
-support, so that second path injects the container at pod admission.
+`auth/` configures SAML against Keycloak: the browser presents its certificate
+to Keycloak, which validates it and issues a signed assertion to Splunk. Only
+the Keycloak hostname prompts for a certificate, and Splunk needs no knowledge
+of how the user proved who they are.
 
-If your users carry client certificates, `auth/saml/keycloak-x509/` wires those in —
-Keycloak validates the certificate and issues the assertion, so Splunk's own
-configuration does not change and only the Keycloak hostname prompts for a cert.
-
-Whatever you choose, **leave the local `admin` account working** — the operator
-authenticates as `admin` with the password from `splunk-<ns>-secret` to push
-bundles and manage the cluster.
+**Leave the local `admin` account working** — the operator authenticates as
+`admin` with the password from `splunk-<ns>-secret` to push bundles and manage
+the cluster.

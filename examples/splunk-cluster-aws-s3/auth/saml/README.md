@@ -1,9 +1,8 @@
 # SAML SSO with Keycloak
 
-Keycloak is a full SAML 2.0 IdP, so Splunk talks to it natively — no
-oauth2-proxy, no ForwardAuth, no trusted-header bypass risk. Keycloak serves
-SAML and OIDC clients from the same realm, so this costs you nothing even if
-everything else you run there is OIDC.
+Keycloak is a full SAML 2.0 IdP, so Splunk talks to it natively. Keycloak serves
+SAML and OIDC clients from the same realm, so realm `jcsc-oauth` hosting a SAML
+client is perfectly normal even if everything else in it is OIDC.
 
 **Scope warning:** the operator has no SSO support whatsoever — there is no
 SAML, LDAP, or auth handling anywhere in the 3.1.0 source or docs. Everything
