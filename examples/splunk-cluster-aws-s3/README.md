@@ -506,11 +506,12 @@ Client certificates authenticate **machines**, not people — there is no x509
 user login for Splunk Web. And Splunk Enterprise has no native OIDC/OAuth
 relying party; its SSO story is **SAML 2.0**.
 
-Keycloak speaks SAML natively alongside OIDC, so `saml/` configures Splunk
-against it directly rather than bridging through oauth2-proxy and a
-trusted-header scheme, which would be a header-spoofing exposure.
+Two certificate-login paths are built under `auth/`: Keycloak SAML, and a
+proxy-SSO route where an nginx sidecar terminates mTLS and Splunk Web binds
+loopback only. `auth/README.md` compares them. Note the operator has no sidecar
+support, so that second path injects the container at pod admission.
 
-If your users carry client certificates, `saml/keycloak-x509/` wires those in —
+If your users carry client certificates, `auth/saml/keycloak-x509/` wires those in —
 Keycloak validates the certificate and issues the assertion, so Splunk's own
 configuration does not change and only the Keycloak hostname prompts for a cert.
 

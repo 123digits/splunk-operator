@@ -1,0 +1,69 @@
+# Expose the nginx sidecar port, and route Traefik to it.
+#
+# Traefik does TLS PASSTHROUGH here - it must not terminate. The whole point is
+# that nginx sees the client certificate; if Traefik terminated, nginx would
+# receive Traefik's connection and every user would collapse into one identity
+# (the same reason forwarder S2S is passthrough in ../../../traefik/).
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-shc-sso
+  namespace: splunk
+spec:
+  ports:
+    - name: https-sso
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+  selector:
+    app.kubernetes.io/managed-by: splunk-operator
+    app.kubernetes.io/component: search-head
+    app.kubernetes.io/name: search-head
+    app.kubernetes.io/part-of: splunk-shc-search-head
+    app.kubernetes.io/instance: splunk-shc-search-head
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: splunk-web-sso
+  namespace: splunk
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: HostSNI(`splunk.example.com`)
+      services:
+        - name: splunk-shc-sso
+          port: 8443
+  tls:
+    passthrough: true
+---
+# Belt and braces: nothing but the sidecar may reach Splunk Web.
+# Splunk Web already binds 127.0.0.1, so this is defence in depth rather than
+# the primary control - but it also documents the intent.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: splunk-web-no-direct-access
+  namespace: splunk
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/managed-by: splunk-operator
+      app.kubernetes.io/name: search-head
+  policyTypes:
+    - Ingress
+  ingress:
+    # SSO port from anywhere (Traefik); 8000 is deliberately absent.
+    - ports:
+        - port: 8443
+          protocol: TCP
+    # Splunk inter-node traffic must keep working.
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/managed-by: splunk-operator
+      ports:
+        - port: 8089
+          protocol: TCP

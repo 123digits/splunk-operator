@@ -1,0 +1,95 @@
+# Sidecar injection via Kyverno.
+#
+# WHY THIS EXISTS: the Splunk operator at 3.1.0 does NOT support sidecars. The
+# pod spec is built in Go with a hardcoded single-container list
+# (pkg/splunk/enterprise/configuration.go, "Containers: []corev1.Container{{
+# ... Name: \"splunk\"}}"), and there is no sidecar, extraContainers or
+# podTemplate override field in any CRD or in either Helm chart. The
+# splunk-enterprise chart only templates custom resources; it never builds pods.
+#
+# So a true sidecar has to be injected at pod admission. Kyverno mutates the pod
+# as it is created; the operator only ever compares StatefulSet specs, so it
+# does not fight the injection or revert it.
+#
+# Alternatives, both worse: fork the operator, or run nginx as a separate
+# Deployment - which loses the loopback trustedIP property that makes this
+# design safe. See README.
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: splunk-sso-nginx-sidecar
+spec:
+  rules:
+    - name: inject-nginx
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              namespaces:
+                - splunk
+              selector:
+                matchLabels:
+                  app.kubernetes.io/managed-by: splunk-operator
+                  # Search heads only. Indexers and managers have no UI worth
+                  # exposing, so do not widen their attack surface.
+                  app.kubernetes.io/name: search-head
+      mutate:
+        patchStrategicMerge:
+          spec:
+            volumes:
+              - name: sso-nginx-conf
+                configMap:
+                  name: splunk-sso-nginx
+              - name: sso-nginx-tls
+                secret:
+                  secretName: splunk-public-tls
+                  defaultMode: 0400
+              - name: sso-nginx-pki
+                secret:
+                  # CA that signed your USER certs, plus its CRL.
+                  # Keys expected: user-ca.pem, user-ca.crl
+                  secretName: user-pki-ca
+                  defaultMode: 0400
+              - name: sso-nginx-tmp
+                emptyDir: {}
+            containers:
+              - name: nginx-sso
+                image: nginxinc/nginx-unprivileged:1.27-alpine
+                ports:
+                  - name: https-sso
+                    containerPort: 8443
+                    protocol: TCP
+                volumeMounts:
+                  - name: sso-nginx-conf
+                    mountPath: /etc/nginx/nginx.conf
+                    subPath: nginx.conf
+                    readOnly: true
+                  - name: sso-nginx-tls
+                    mountPath: /etc/nginx/tls
+                    readOnly: true
+                  - name: sso-nginx-pki
+                    mountPath: /etc/nginx/pki
+                    readOnly: true
+                  - name: sso-nginx-tmp
+                    mountPath: /tmp
+                securityContext:
+                  runAsNonRoot: true
+                  runAsUser: 101
+                  allowPrivilegeEscalation: false
+                  readOnlyRootFilesystem: true
+                  capabilities:
+                    drop: ["ALL"]
+                resources:
+                  requests:
+                    cpu: 100m
+                    memory: 128Mi
+                  limits:
+                    cpu: 500m
+                    memory: 256Mi
+                readinessProbe:
+                  tcpSocket:
+                    port: 8443
+                  initialDelaySeconds: 5
+                  periodSeconds: 10
