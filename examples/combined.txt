@@ -1,3 +1,29 @@
+================================================================================
+ BUNDLE: examples/splunk-cluster-aws-s3
+ A single-file concatenation of the whole example directory. Each file below is
+ introduced by a line of the form:   ==== FILE: <relative/path> ====
+================================================================================
+
+ EXTRACT (recreates subdirectories, writes into the current directory):
+
+   awk '/^==== FILE: /{f=$0;sub(/^==== FILE: /,"",f);sub(/ ====$/,"",f);n=split(f,a,"/");d="";for(i=1;i<n;i++)d=d a[i]"/";if(d)system("mkdir -p \""d"\"");next} !f{next} {print>f}' combined.txt
+
+ The  !f{next}  rule is required and skips this header. Without it, awk tries to
+ write these lines before any filename is known and dies with
+ `cannot open "" for output`.
+
+ Extraction is content-exact but not byte-exact: each file comes back with one
+ extra trailing blank line, from the separator the bundler writes between files.
+
+ REGENERATE (must write OUTSIDE the directory being walked, or find picks the
+ output file up and concatenates it into itself):
+
+   cd examples/splunk-cluster-aws-s3
+   find . -type f -exec sh -c 'printf "==== FILE: %s ====\n" "$1"; cat "$1"; printf "\n"' _ {} \; > ../combined.txt
+   # then re-prepend this header
+
+================================================================================
+
 ==== FILE: ./05-indexercluster.yaml ====
 # IndexerCluster - the peers. Deliberately thin:
 #   - no smartstore stanza (inherited from the ClusterManager bundle)
