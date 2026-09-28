@@ -1,0 +1,3433 @@
+==== FILE: ./05-indexercluster.yaml ====
+# IndexerCluster - the peers. Deliberately thin:
+#   - no smartstore stanza (inherited from the ClusterManager bundle)
+#   - no appRepo (not supported on this CRD; apps arrive via CM bundle push)
+# Spread peers across AZs so one zone loss cannot take the cluster down.
+apiVersion: enterprise.splunk.com/v4
+kind: IndexerCluster
+metadata:
+  annotations:
+    # kiam: propagated to the pod template by the operator via AppendParentMeta,
+    # so the pods assume this role. Must match the namespace's permitted regex.
+    # Changing this value changes the pod template -> rolling restart.
+    iam.amazonaws.com/role: SplunkS3Access
+  name: idxc
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  # cert-manager secret mounted at /mnt/splunk-tls (operator mounts custom
+  # volumes at /mnt/<name> in every container). tls-combined.pem is the
+  # key+cert file Splunk's serverCert wants; ca.crt is what the verifying
+  # probes and peer checks validate against.
+  volumes:
+    - name: splunk-tls
+      secret:
+        secretName: splunk-indexer-tls
+        defaultMode: 0400
+  extraEnv:
+    - name: SPLUNK_TLS_CA_PATH
+      value: /mnt/splunk-tls/ca.crt
+  image: splunk/splunk:10.2.0
+  replicas: 3
+  clusterManagerRef:
+    name: cm
+  licenseManagerRef:
+    name: lm
+  monitoringConsoleRef:
+    name: mc
+
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 15Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Sized for hot buckets + SmartStore cache, NOT for full retention.
+    storageCapacity: 500Gi
+
+  resources:
+    requests:
+      cpu: "4"
+      memory: 12Gi
+    limits:
+      cpu: "8"
+      memory: 24Gi
+
+  # HARD separation: no two indexer peers may share a Kubernetes node.
+  #
+  # The operator already injects a podAntiAffinity term for this, but only as
+  # PreferredDuringScheduling (weight 100) - see AppendPodAntiAffinity in
+  # pkg/splunk/common/util.go. Preferred is best-effort: under pressure the
+  # scheduler will happily stack two peers on one node, and a single node
+  # failure then takes out two replicas at once.
+  #
+  # This Required term is what actually enforces it. The operator appends its
+  # Preferred term to whatever is set here rather than replacing it, so both
+  # end up on the pod.
+  #
+  # Consequence: you need at least as many schedulable nodes as replicas, in
+  # the right AZs. A replica with nowhere to go stays Pending rather than
+  # doubling up - which is the intended trade.
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/instance
+                operator: In
+                values:
+                  - splunk-idxc-indexer
+          topologyKey: kubernetes.io/hostname
+
+  # AZ spread stays SOFT on purpose. Hard zone spread (DoNotSchedule) would
+  # leave pods Pending whenever a zone is short on capacity, and EBS volumes
+  # are already pinned to a zone - so a replacement must return to its original
+  # AZ regardless. Soft spread balances without blocking recovery.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: indexer
+          app.kubernetes.io/part-of: splunk-cm-indexer
+
+==== FILE: ./auth/keycloak-realm.json ====
+{
+  "_comment": [
+    "Partial realm import for realm jcsc-oauth: the two Splunk roles plus the",
+    "gate that denies everyone else.",
+    "",
+    "s4k_hs_access is a marker role. s4k_hs_admin and s4k_hs_user are COMPOSITE",
+    "roles that include it, so granting either automatically grants access and",
+    "there is only one role for the deny condition to test. Nobody is assigned",
+    "s4k_hs_access directly.",
+    "",
+    "Apply with: Realm Settings -> Action -> Partial import, or via",
+    "keycloak-config-cli / the Keycloak Operator's KeycloakRealmImport CRD.",
+    "",
+    "Authenticator provider IDs and config key names are stable across recent",
+    "Keycloak but are NOT guaranteed across major versions. Import into a test",
+    "realm first and compare against a UI-built flow before trusting it.",
+    "",
+    "This grants nothing by itself. After importing you must still bind the",
+    "flow to the Splunk client: Clients -> splunk-hs -> Advanced ->",
+    "Authentication flow overrides -> Browser Flow = splunk-browser."
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "s4k_hs_access",
+        "description": "Marker role gating login to the splunk-hs client. Do not assign directly; granted via the composite roles below."
+      },
+      {
+        "name": "s4k_hs_admin",
+        "description": "Splunk administrators. Maps to the Splunk admin role.",
+        "composite": true,
+        "composites": {
+          "realm": [
+            "s4k_hs_access"
+          ]
+        }
+      },
+      {
+        "name": "s4k_hs_user",
+        "description": "Standard Splunk users. Maps to the Splunk user role.",
+        "composite": true,
+        "composites": {
+          "realm": [
+            "s4k_hs_access"
+          ]
+        }
+      }
+    ]
+  },
+  "authenticationFlows": [
+    {
+      "alias": "splunk-browser",
+      "description": "Browser flow for the Splunk SAML client: denies users lacking splunk-access",
+      "providerId": "basic-flow",
+      "topLevel": true,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "auth-cookie",
+          "requirement": "ALTERNATIVE",
+          "priority": 10,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false
+        },
+        {
+          "flowAlias": "splunk-browser-forms",
+          "requirement": "ALTERNATIVE",
+          "priority": 20,
+          "userSetupAllowed": false,
+          "autheticatorFlow": true
+        },
+        {
+          "flowAlias": "splunk-browser-authz",
+          "requirement": "REQUIRED",
+          "priority": 30,
+          "userSetupAllowed": false,
+          "autheticatorFlow": true
+        }
+      ]
+    },
+    {
+      "alias": "splunk-browser-forms",
+      "description": "Certificate authentication. Swap x509 for the form authenticator if not using client certs.",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "auth-x509-client-username-form",
+          "requirement": "ALTERNATIVE",
+          "priority": 10,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false
+        },
+        {
+          "authenticator": "auth-username-password-form",
+          "requirement": "ALTERNATIVE",
+          "priority": 20,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false
+        }
+      ]
+    },
+    {
+      "alias": "splunk-browser-authz",
+      "description": "Conditional deny: runs only when the user lacks splunk-access",
+      "providerId": "basic-flow",
+      "topLevel": false,
+      "builtIn": false,
+      "authenticationExecutions": [
+        {
+          "authenticator": "conditional-user-role",
+          "requirement": "REQUIRED",
+          "priority": 10,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false,
+          "authenticatorConfig": "splunk-access-negated"
+        },
+        {
+          "authenticator": "deny-access-authenticator",
+          "requirement": "REQUIRED",
+          "priority": 20,
+          "userSetupAllowed": false,
+          "autheticatorFlow": false,
+          "authenticatorConfig": "splunk-access-denied-message"
+        }
+      ]
+    }
+  ],
+  "authenticatorConfig": [
+    {
+      "alias": "splunk-access-negated",
+      "config": {
+        "condition.user.role": "s4k_hs_access",
+        "negate": "true"
+      }
+    },
+    {
+      "alias": "splunk-access-denied-message",
+      "config": {
+        "error_message": "Your account is not authorized for Splunk. Request the s4k_hs_admin or s4k_hs_user role."
+      }
+    }
+  ]
+}
+
+==== FILE: ./auth/keycloak-mtls-passthrough.yaml ====
+# ALTERNATIVE to traefik-mtls.yaml: TLS passthrough so KEYCLOAK itself performs
+# the mTLS handshake.
+#
+# Fewer moving parts and no header-format negotiation - Keycloak gets the real
+# certificate from its own TLS stack rather than a reconstructed PEM string.
+# Prefer this unless you need Traefik to do HTTP-level routing for Keycloak.
+#
+# Trade-off: raw TCP, so Traefik cannot route by path, add middlewares, or
+# terminate for this host. Keycloak owns the public certificate too.
+#
+# Keycloak container settings for this mode:
+#   KC_HTTPS_CLIENT_AUTH=request      # 'request' = optional, 'required' = mandatory
+#   KC_TRUSTSTORE_PATHS=/opt/keycloak/conf/truststores
+# with your user PKI CA mounted into that truststore directory.
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: keycloak-passthrough
+  namespace: keycloak
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - match: HostSNI(`keycloak.example.com`)
+      services:
+        - name: keycloak
+          port: 8443
+  tls:
+    passthrough: true
+
+==== FILE: ./auth/README.md ====
+# User authentication — SAML 2.0 with Keycloak
+
+Users authenticate to Keycloak with a client certificate; Keycloak validates it
+and issues a signed assertion to Splunk.
+
+Splunk cannot identify a person from a certificate itself. Verified against the
+10.4 `authentication.conf` reference: there is no x509 or client-certificate
+user authentication anywhere in it (the one `clientCert` setting is Splunk's own
+outbound TLS to LDAP/SAML), and `authType` accepts exactly `Splunk`, `LDAP`,
+`Scripted`, `SAML`, `ProxySSO`. There is no OIDC authorization-code flow either
+— no `redirect_uri`, `authorization_endpoint` or `response_type` exists in the
+file. So validation happens at Keycloak, and Splunk learns the identity over
+signed SAML.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `splunk_saml_app/` | The Splunk app. `default/` nesting is Splunk's required layout |
+| `keycloak-realm.json` | Realm roles and the flow denying everyone else |
+| `keycloak-mtls-passthrough.yaml` | Certificate login — Keycloak terminates TLS (**preferred**) |
+| `keycloak-mtls-traefik.yaml` | Certificate login — Traefik terminates, forwards cert in a header |
+
+## Realm and roles
+
+| | |
+|---|---|
+| Keycloak realm | `jcsc-oauth` |
+| Client | `splunk-hs` |
+| Admin | realm role `s4k_hs_admin` -> Splunk `admin` |
+| Standard | realm role `s4k_hs_user` -> Splunk `user` |
+
+Both map onto built-in Splunk roles, so there is no `authorize.conf` to ship.
+`user` is the least-privilege built-in but is **not** strictly read-only — it can
+create its own knowledge objects and schedule searches.
+
+`s4k_hs_access` is a third role existing only as a composite marker inside the
+other two, so the login gate has a single role to test. Nobody is assigned it
+directly.
+
+---
+
+## 1. Keycloak realm setup
+
+### Roles and the access gate
+
+Realm isolation is structural and free: a user belongs to one realm, the client
+lives in one realm, and Splunk trusts exactly one realm signing certificate, so
+an assertion from anywhere else fails signature verification.
+
+The gap is **inside** the realm. Keycloak's default is that any authenticated
+user can log into any client, so realm membership alone is not a restriction.
+
+`keycloak-realm.json` imports three roles:
+
+| Role | Composite of | Assign to people? |
+|---|---|---|
+| `s4k_hs_access` | — | No, marker only |
+| `s4k_hs_admin` | `s4k_hs_access` | Yes |
+| `s4k_hs_user` | `s4k_hs_access` | Yes |
+
+and a `splunk-browser` flow containing a conditional sub-flow:
+
+- **Condition - user role** → `s4k_hs_access`, **Negate output: ON**
+- **Deny Access**
+
+Reads as *if the user has neither Splunk role, deny*. Adding a third Splunk role
+later means making it composite of `s4k_hs_access` too; the flow is unchanged.
+
+If your Keycloak version lacks *Negate output* on the role condition, invert it:
+make authentication conditional on holding the role, with Deny Access terminal.
+
+### Bind the flow to the client only
+
+Clients → `splunk-hs` → Advanced → **Authentication flow overrides** →
+Browser Flow = `splunk-browser`.
+
+This step is what makes it safe. Editing the realm's default browser flow would
+deny those users **every** client in the realm.
+
+Provider IDs and config keys in the JSON are stable across recent Keycloak but
+not guaranteed across major versions — import into a test realm and compare
+against a UI-built flow first. Importing grants nothing until the flow is bound.
+
+### SAML client
+
+| Setting | Value |
+|---|---|
+| Client ID | `splunk-hs` (must equal `entityId` in `authentication.conf`) |
+| Valid redirect URIs | `https://splunk.example.com/*` |
+| Master SAML Processing URL | `https://splunk.example.com/saml/acs` |
+| Name ID format | `username` or `email` |
+| Sign documents / assertions | On |
+
+Add a **Role list** mapper so realm roles reach Splunk in the assertion. Splunk
+cannot query Keycloak for attributes afterwards — if roles are not in the
+assertion, the user logs in with nothing.
+
+### IdP signing certificate
+
+From `https://keycloak.example.com/realms/jcsc-oauth/protocol/saml/descriptor`,
+take the `<ds:X509Certificate>` value, wrap it in PEM headers, and load it:
+
+```bash
+kubectl -n splunk create secret generic splunk-saml-idp \
+  --from-file=keycloak-signing.pem
+```
+
+The SearchHeadCluster CR already mounts it as volume `saml`, landing at
+`/mnt/saml/keycloak-signing.pem` to match `idpCertPath`.
+
+---
+
+## 2. Certificate login
+
+The certificate is checked at **Keycloak**, not by Splunk and not on the Splunk
+route:
+
+```
+browser ──TLS + client cert──> Keycloak    validates cert, checks issuer + CRL,
+                                   │        maps subject -> user,
+                                   │        signs assertion
+                                   ▼
+browser <──────── 302 with SAML assertion ─┘
+   │
+   └──POST /saml/acs──> Traefik ──> Splunk Web
+```
+
+Splunk's configuration is indifferent to how the user proved who they are — swap
+Keycloak to WebAuthn or OTP later and nothing here changes. Browsers also prompt
+for certificates **per hostname**, so only the Keycloak host asks for one.
+
+### Which topology
+
+`keycloak-mtls-passthrough.yaml` is preferred: Keycloak terminates TLS and takes
+the certificate from its own stack. No header, no escaping, no cert-lookup
+provider config, and no header-spoofing path.
+
+```
+KC_HTTPS_CLIENT_AUTH=request      # 'required' to refuse connections without one
+KC_TRUSTSTORE_PATHS=/opt/keycloak/conf/truststores
+```
+
+`keycloak-mtls-traefik.yaml` terminates at Traefik and forwards the certificate
+as `X-Forwarded-Tls-Client-Cert`. Use it only if you need HTTP-level routing in
+front of Keycloak, and note two costs:
+
+- Keycloak's cert-lookup providers expect nginx's or haproxy's header name and
+  escaping, so you must point it at the right one and verify the PEM parses:
+  `--spi-x509cert-lookup-provider=nginx`
+  `--spi-x509cert-lookup-nginx-ssl-client-cert=X-Forwarded-Tls-Client-Cert`
+- Anything reaching Keycloak directly can forge that header. Needs a
+  NetworkPolicy restricting Keycloak's port to Traefik, and Traefik must strip
+  any inbound value before setting its own.
+
+### Keycloak browser flow for X509
+
+Authentication → Flows → add **X509/Validate Username Form** to the
+`splunk-browser` flow.
+
+| Setting | Notes |
+|---|---|
+| User Identity Source | `Subject's Common Name`, or a SAN field |
+| User Mapping Method | Username or Email, matching your realm |
+| **CRL Checking Enabled** | Turn on |
+| **OCSP Checking Enabled** | Turn on if your PKI has a responder |
+| Revalidate Client Certificate | On |
+
+Revocation checking is the setting people skip. Without it a revoked
+certificate authenticates for its full validity period — a departed employee's
+smartcard keeps working.
+
+**The stock form is not click-free.** It shows a confirmation page with the
+identified subject and a Continue button. Truly automatic login needs a theme
+override that auto-submits, or a custom authenticator. Budget for it rather
+than assuming.
+
+### Three CAs, kept separate
+
+| Purpose | CA |
+|---|---|
+| Pod-to-pod Splunk traffic | cert-manager internal CA (`../tls/`) |
+| Browser-facing server certs | Public / Let's Encrypt (`../tls/`) |
+| **User client certs** | Your corporate/smartcard PKI |
+
+If the internal CA could also sign user certs, any pod's service certificate
+would authenticate as a person.
+
+---
+
+## 3. Splunk side
+
+### The reverse-proxy trap
+
+Splunk builds its SAML callback URL from its *own* view of the world — Splunk
+Web on port 8000. Users arrive through Traefik on 443. Uncorrected, Splunk hands
+Keycloak a callback pointing at `:8000`, the browser cannot reach it, and login
+dies after the IdP redirect with no useful error.
+
+```ini
+fqdn = https://splunk.example.com
+redirectPort = 443
+```
+
+Set these to what the **browser** sees, not what the pod sees.
+
+### Role mapping direction
+
+```ini
+[roleMap_SAML]        # <Splunk role> = <Keycloak realm role>
+admin = s4k_hs_admin
+user  = s4k_hs_user
+```
+
+Splunk role on the **left**. (`roleMap_proxySSO` is the same way round;
+`oauth2_external_role_mapping` is the reverse — worth knowing if you ever add
+one.)
+
+Keycloak's Role list mapper emits the attribute as `Role`, while Splunk looks
+for `role`, so `roleAttributeName = Role` is set. A mismatch here is the single
+most common cause of "login works but the user has no roles".
+
+### Distribution
+
+`authentication.conf` must be identical on every search head, so it ships
+through the **deployer** at cluster scope. The SearchHeadCluster CR already has
+the app source:
+
+```yaml
+  appRepo:
+    appSources:
+      - name: samlAuth
+        location: saml-auth/
+```
+
+```bash
+tar -czf splunk_saml_app.tgz splunk_saml_app/
+aws s3 cp splunk_saml_app.tgz s3://my-splunk-apps/saml-auth/
+```
+
+All members share one SP `entityId` and one hostname, which is correct —
+Keycloak sees a single service, and Traefik's sticky cookie pins a session to
+one member. Without that stickiness SAML sessions break exactly as ordinary
+Splunk Web sessions do.
+
+The Cluster Manager and Monitoring Console are separate SPs on separate
+hostnames. Either register a Keycloak client per host, or leave them on local
+admin auth and reach them by port-forward — for two operator-facing UIs that is
+often the saner trade.
+
+---
+
+## Verifying
+
+```bash
+# Splunk parsed the config
+kubectl -n splunk exec splunk-shc-search-head-0 -- \
+  /opt/splunk/bin/splunk btool authentication list --debug | grep -A20 '\[jcsc-oauth\]'
+```
+
+Test the gate with a realm user holding neither role. Correct behaviour is
+rejection **at Keycloak**, before any redirect — you should never reach
+`/saml/acs`. Landing on a Splunk error page instead means the flow override did
+not bind, and you are relying on Splunk's role mapping as the gate. Do not:
+authentication has already succeeded by then, a session and audit entry exist,
+and the decision would live in an app a bad bundle push could widen.
+
+| Symptom | Cause |
+|---|---|
+| Redirect lands on `:8000` and hangs | `fqdn` / `redirectPort` not browser-facing |
+| Login succeeds, user sees nothing | Role attribute name mismatch (`Role` vs `role`) |
+| "Assertion signature verification failed" | Wrong or stale realm signing cert |
+| Works on one member, fails on others | App not distributed via deployer, or sticky sessions off |
+| Unauthorized user still gets in | Flow not bound to the client, or brokered identity granted a real role |
+
+**Identity brokering re-opens the realm boundary.** Brokered users become realm
+users and inherit the same default. Check your first-login flow and any identity
+provider role mappers, which can grant roles at account creation.
+
+Keep a local-auth path open while testing. Splunk accepts `admin` at
+`/account/login?loginType=splunk` even with SAML enabled — worth knowing before
+you lock yourself out.
+
+---
+
+## What applies regardless
+
+- **The local `admin` account must keep working.** The operator authenticates as
+  `admin` using the password in `splunk-<ns>-secret` for bundle pushes and
+  cluster operations. SSO is for humans; do not disable native auth.
+- **Port 8089 stays on the network.** Cluster traffic, replication and the
+  operator's REST calls all cross pods on 8089; it is protected by mutual TLS in
+  `../tls/`.
+- **These are Splunk product settings, not operator features.** The operator has
+  no authentication support in 3.1.0 — it just ships the app. Unlike the CR
+  manifests, nothing here is schema-validated by this repo, so check key names
+  against the `.spec` files for your Splunk version. This deployment pins
+  `splunk/splunk:10.2.0` while the reference consulted was 10.4.
+
+==== FILE: ./auth/keycloak-mtls-traefik.yaml ====
+# Client-certificate login: Traefik-terminated mTLS in front of KEYCLOAK.
+#
+# Note what this does NOT touch: the Splunk routes. The browser presents its
+# certificate to Keycloak's hostname only. Splunk never sees the cert and needs
+# no changes - it just consumes the SAML assertion Keycloak produces. That also
+# means users are not prompted for a certificate when hitting Splunk directly.
+#
+# This is the "header" approach. See passthrough.yaml for the alternative and
+# README.md for which to pick - the header format is the fiddly part.
+---
+# Makes Traefik REQUEST and VERIFY a client cert on this endpoint.
+# RequireAndVerifyClientCert: no valid cert, no connection. Use
+# VerifyClientCertIfGiven only if you need a password fallback on the same host.
+apiVersion: traefik.io/v1alpha1
+kind: TLSOption
+metadata:
+  name: keycloak-mtls
+  namespace: keycloak
+spec:
+  minVersion: VersionTLS12
+  clientAuth:
+    # Secret(s) holding the CA that signed your USER certificates. This is your
+    # corporate/smartcard PKI - NOT the cert-manager internal CA from ../tls,
+    # which signs server certs for pod-to-pod traffic. Different trust domain,
+    # deliberately: an internal service cert must never authenticate a human.
+    secretNames:
+      - user-pki-ca
+    clientAuthType: RequireAndVerifyClientCert
+---
+# Forwards the verified client cert to Keycloak as a header.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: keycloak-client-cert
+  namespace: keycloak
+spec:
+  passTLSClientCert:
+    pem: true
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`keycloak.example.com`)
+      middlewares:
+        - name: keycloak-client-cert
+      services:
+        - name: keycloak
+          port: 8443
+          scheme: https
+          serversTransport: keycloak-backend
+  tls:
+    secretName: keycloak-public-tls
+    options:
+      name: keycloak-mtls
+      namespace: keycloak
+---
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: keycloak-backend
+  namespace: keycloak
+spec:
+  serverName: keycloak.keycloak.svc
+  rootCAsSecrets:
+    - splunk-internal-ca
+  insecureSkipVerify: false
+
+==== FILE: ./auth/splunk_saml_app/default/app.conf ====
+[install]
+is_configured = 0
+
+[ui]
+is_visible = 0
+label = Splunk SAML SSO
+
+[launcher]
+author = platform
+description = SAML SSO against Keycloak
+version = 1.0
+
+==== FILE: ./auth/splunk_saml_app/default/authentication.conf ====
+# Splunk SAML SSO against Keycloak.
+#
+# Setting names below are Splunk product configuration, NOT anything the
+# operator knows about - the operator has no SSO support at all and simply runs
+# whatever authentication.conf you ship it. Verify key names against the
+# authentication.conf.spec for YOUR Splunk version before rolling out.
+
+[authentication]
+authType = SAML
+authSettings = jcsc-oauth
+
+[jcsc-oauth]
+# --- Who Splunk is (the SP) ---
+# entityId must match the Client ID of the SAML client you create in Keycloak.
+entityId = splunk-hs
+
+# fqdn / redirectPort are the settings that break behind a reverse proxy.
+# Splunk builds its ACS URL from these. Users arrive on Traefik at :443, but
+# Splunk Web listens on :8000 - without these it hands Keycloak a callback URL
+# pointing at :8000 and the login round trip dead-ends. Set them to what the
+# BROWSER sees, not what the pod sees.
+fqdn = https://splunk.example.com
+redirectPort = 443
+
+# --- Who Keycloak is (the IdP) ---
+# Realm endpoints. Descriptor (for the cert) lives at:
+#   https://keycloak.example.com/realms/jcsc-oauth/protocol/saml/descriptor
+idpSSOUrl = https://keycloak.example.com/realms/jcsc-oauth/protocol/saml
+idpSLOUrl = https://keycloak.example.com/realms/jcsc-oauth/protocol/saml
+
+# Keycloak's realm SIGNING certificate, mounted from a secret at /mnt/saml.
+# This is what makes the assertion trustworthy - it is the whole security
+# boundary of SAML, so treat a change to this file as a security event.
+idpCertPath = /mnt/saml/keycloak-signing.pem
+
+# --- Assertion handling ---
+# Require signed assertions and sign our own requests. Both sides authenticated.
+signedAssertion = true
+signAuthnRequest = true
+
+# Keycloak's "Role list" mapper emits the attribute named "Role" by default,
+# while Splunk looks for "role". Rather than fight it, tell Splunk the name.
+# Case matters here and a mismatch is the single most common symptom of
+# "login works but the user has no roles".
+roleAttributeName = Role
+
+# Splunk cannot do SAML attribute queries against Keycloak; roles must arrive
+# in the assertion itself.
+attributeQueryRequestSigned = false
+
+# --- Map Keycloak groups/roles to Splunk roles ---
+# Left side is the SPLUNK role, right side is the value Keycloak sends.
+# Semicolon-separated for multiple.
+# Keycloak REALM ROLES on the right, Splunk roles on the left.
+# Keycloak's Role list mapper emits realm roles under the attribute named by
+# roleAttributeName above.
+# Direction: <Splunk role> = <Keycloak realm role>.
+# Note this is the OPPOSITE of [oauth2_external_role_mapping_*], which is
+# <idp_group> = <Splunk roles>. Easy to invert by accident.
+[roleMap_SAML]
+admin = s4k_hs_admin
+user  = s4k_hs_user
+
+==== FILE: ./10-karpenter-nodepool.yaml ====
+# Karpenter NodePool for the Splunk tiers.
+#
+# PDBs alone are NOT sufficient with Karpenter. Two gaps they do not cover:
+#
+#   1. terminationGracePeriod on the NodePool is a HARD deadline. When set,
+#      Karpenter force-terminates the node when it expires, PDBs and all. Leave
+#      it unset (as here) so PDBs are actually honoured, or set it comfortably
+#      longer than a Splunk pod needs to shut down and reattach its volume.
+#
+#   2. PDBs only gate VOLUNTARY disruption. Spot reclamation, hardware failure
+#      and node crashes ignore them entirely. Splunk's replication_factor is
+#      what covers that case, not Kubernetes.
+#
+# disruption.budgets below is the real lever: it caps how many nodes Karpenter
+# will disrupt at once, cluster-wide, before per-pod PDBs even come into play.
+---
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: splunk
+spec:
+  template:
+    metadata:
+      labels:
+        workload: splunk
+    spec:
+      nodeClassRef:
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+        name: splunk
+      requirements:
+        - key: karpenter.sh/capacity-type
+          operator: In
+          # On-demand only. Spot reclamation is involuntary, so it bypasses
+          # every PDB here and can take several peers at once.
+          values: ["on-demand"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        # Must span every AZ your PVCs live in. An EBS volume is zonal, so a
+        # replacement pod has to return to its original AZ - if Karpenter
+        # cannot provision there, the pod stays Pending with the data intact
+        # but unreachable.
+        - key: topology.kubernetes.io/zone
+          operator: In
+          values: ["us-east-1a", "us-east-1b", "us-east-1c"]
+      # NO terminationGracePeriod here - see the note above.
+      expireAfter: 720h
+
+  disruption:
+    # Only consolidate genuinely empty nodes. WhenEmptyOrUnderutilized would
+    # repack Splunk pods for bin-packing reasons, and every move costs a volume
+    # detach/attach plus a Splunk restart on a stateful pod.
+    consolidationPolicy: WhenEmpty
+    consolidateAfter: 5m
+    budgets:
+      # At most one node disrupted at a time across this pool. Combined with
+      # the PDBs, that means at most one indexer and one search head are ever
+      # in flight.
+      - nodes: "1"
+      # Nothing voluntary during the working day. Adjust or drop if your
+      # maintenance expectations differ - times are UTC.
+      - schedule: "0 12 * * mon-fri"
+        duration: 10h
+        nodes: "0"
+
+  limits:
+    cpu: "200"
+    memory: 800Gi
+
+==== FILE: ./optional/heavy-forwarder-syslog.yaml ====
+# OPTIONAL - a heavy forwarder tier for sources that cannot speak S2S or HEC
+# (syslog, SNMP traps, scripted inputs, DB connect).
+#
+# Nothing in the operator terminates syslog. A Standalone CR running as a
+# forwarder gives you somewhere to land it. The alternative is Splunk Connect
+# for Syslog writing to the HEC endpoint in 08-ingest-endpoints.yaml.
+---
+apiVersion: enterprise.splunk.com/v4
+kind: Standalone
+metadata:
+  annotations:
+    # kiam: propagated to the pod template by the operator via AppendParentMeta,
+    # so the pods assume this role. Must match the namespace's permitted regex.
+    # Changing this value changes the pod template -> rolling restart.
+    iam.amazonaws.com/role: SplunkS3Access
+  name: hwf
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.2.0
+  replicas: 2
+  licenseManagerRef:
+    name: lm
+  clusterManagerRef:
+    name: cm
+  monitoringConsoleRef:
+    name: mc
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Queues/persistent queue only - a forwarder does not retain indexed data.
+    storageCapacity: 50Gi
+  # Forward everything on to the indexer cluster rather than indexing locally.
+  defaults: |-
+    splunk:
+      app_paths_install:
+        default: []
+  # Expose a syslog listener alongside the default ports. You still need a
+  # matching inputs.conf (ship it as a local-scope app via appRepo).
+  serviceTemplate:
+    spec:
+      type: LoadBalancer
+      ports:
+        - name: syslog-tcp
+          port: 5514
+          targetPort: 5514
+          protocol: TCP
+---
+# Dedicated LB for the syslog listener. Keep externalTrafficPolicy: Local so the
+# original client IP survives - syslog sourcetyping usually depends on it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-syslog
+  namespace: splunk
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: syslog-tcp
+      port: 5514
+      targetPort: 5514
+      protocol: TCP
+  selector:
+    app.kubernetes.io/managed-by: splunk-operator
+    app.kubernetes.io/component: standalone
+    app.kubernetes.io/name: standalone
+    app.kubernetes.io/part-of: splunk-hwf-standalone
+    app.kubernetes.io/instance: splunk-hwf-standalone
+
+==== FILE: ./optional/ingestion-separation.yaml ====
+# OPTIONAL - Splunk 10.2+ only ("SmartBus" / index-ingest separation).
+#
+# Splits receiving from indexing: an IngestorCluster terminates S2S/HEC and publishes
+# to SQS; the IndexerCluster consumes from SQS and indexes. Large messages spill to S3.
+# Gives you independent scaling of ingest vs index, and a durable buffer.
+#
+# If you deploy this, ingest traffic targets the INGESTOR service, not the indexer
+# service, and 03-indexercluster.yaml must gain queueRef + objectStorageRef.
+# queueRef/objectStorageRef are immutable after creation. Skip this file unless you
+# specifically want ingestion separation - the plain C3 in 01-06 does not need it.
+---
+apiVersion: enterprise.splunk.com/v4
+kind: Queue
+metadata:
+  name: queue
+  namespace: splunk
+spec:
+  provider: sqs
+  sqs:
+    name: splunk-ingest
+    authRegion: us-east-1
+    endpoint: https://sqs.us-east-1.amazonaws.com
+    dlq: splunk-ingest-dlq
+    # No volumes: credentials come from kiam via the IngestorCluster pod
+    # annotation. Only set volumes/secretRef if you must use static keys.
+    # volumes:
+    #   - name: s3-sqs-volume
+    #     secretRef: s3-secret
+---
+apiVersion: enterprise.splunk.com/v4
+kind: ObjectStorage
+metadata:
+  name: os
+  namespace: splunk
+spec:
+  provider: s3
+  s3:
+    path: my-splunk-ingest-overflow/smartbus/
+    endpoint: https://s3.us-east-1.amazonaws.com
+---
+apiVersion: enterprise.splunk.com/v4
+kind: IngestorCluster
+metadata:
+  annotations:
+    # kiam: propagated to the pod template by the operator via AppendParentMeta,
+    # so the pods assume this role. Must match the namespace's permitted regex.
+    # Changing this value changes the pod template -> rolling restart.
+    iam.amazonaws.com/role: SplunkS3Access
+  name: ingestor
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  image: splunk/splunk:10.2.0
+  replicas: 3
+  licenseManagerRef:
+    name: lm
+  monitoringConsoleRef:
+    name: mc
+  queueRef:
+    name: queue
+  objectStorageRef:
+    name: os
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Ingestors do not retain data; they forward to SQS.
+    storageCapacity: 50Gi
+
+==== FILE: ./traefik/02-ingressroute-ui.yaml ====
+# Splunk Web UIs via Traefik, TLS terminated at the edge and RE-ENCRYPTED to
+# the pods. Traffic is never in plaintext, and both legs are authenticated:
+# the browser verifies the public cert, Traefik verifies the backend against
+# our internal CA (see 01-serverstransport.yaml).
+#
+# Why this model rather than TLS passthrough: passthrough is pure TCP, so
+# Traefik cannot set a cookie, and Splunk Web on a 3-member search head cluster
+# NEEDS session stickiness. Round-robining a logged-in session across members
+# gives users random logouts and blank pages. See traefik/README.md for the
+# passthrough variant and when it is the right call.
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunk-web
+  namespace: splunk
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`splunk.example.com`)
+      services:
+        - name: splunk-shc-search-head-service
+          port: 8000
+          scheme: https
+          serversTransport: splunk-searchhead
+          # Required for Splunk Web across SHC members.
+          sticky:
+            cookie:
+              name: splunk_sh
+              secure: true
+              httpOnly: true
+              sameSite: lax
+  tls:
+    secretName: splunk-public-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunk-mc
+  namespace: splunk
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`mc.splunk.example.com`)
+      services:
+        - name: splunk-mc-monitoring-console-service
+          port: 8000
+          scheme: https
+          serversTransport: splunk-managers
+  tls:
+    secretName: splunk-public-tls
+---
+# Cluster Manager UI. Single pod, so no stickiness needed.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunk-cm
+  namespace: splunk
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`cm.splunk.example.com`)
+      services:
+        - name: splunk-cm-cluster-manager-service
+          port: 8000
+          scheme: https
+          serversTransport: splunk-managers
+  tls:
+    secretName: splunk-public-tls
+
+==== FILE: ./traefik/README.md ====
+# Traefik
+
+Note up front: the operator's own docs cover Istio and NGINX only — there is no
+Traefik guidance upstream at 3.1.0. These manifests are written against
+`traefik.io/v1alpha1` (Traefik v3). On Traefik v2 the group is
+`traefik.containo.us/v1alpha1`; the schemas are otherwise the same here.
+
+## Which pods actually have a UI
+
+**All of them.** The operator gives port 8000 (Splunk Web) and 8089 (splunkd) to
+every instance type — see `getSplunkPorts` in
+`pkg/splunk/enterprise/configuration.go`. So all 9 pods in this deployment serve
+a UI. That is not the same as all 9 being worth exposing:
+
+| Service | UI | Expose? |
+|---|---|---|
+| `splunk-shc-search-head-service` | searching, dashboards | Yes — this is the one users want |
+| `splunk-mc-monitoring-console-service` | health, topology | Yes — for operators |
+| `splunk-cm-cluster-manager-service` | indexer cluster status, bundle pushes | Yes — for operators |
+| `splunk-lm-license-manager-service` | license usage | Rarely; port-forward is usually enough |
+| `splunk-shc-deployer-service` | deployer status | No — port-forward when needed |
+| `splunk-idxc-indexer-service` | per-peer UI | No — use the MC instead |
+
+The three routes in `02-ingressroute-ui.yaml` cover the first three. Reach the
+rest with `kubectl port-forward` rather than widening your attack surface for
+something you open twice a year.
+
+## Termination model, and why it differs per channel
+
+Splunk's own support matrix (`docs/Security.md`) is blunt about this:
+
+| Traffic | Gateway termination | End-to-end |
+|---|---|---|
+| Splunk Web | **NO** | YES |
+| REST API | **NO** | YES |
+| Forwarders | YES | YES |
+
+"Gateway termination" there means terminating TLS at the edge and sending
+**plaintext** to the pod. That is unsupported for Web and REST. What these
+manifests do instead is terminate at Traefik and **re-encrypt** to the pod, so
+no leg is ever plaintext — which satisfies the constraint while still letting
+Traefik act as an HTTP router.
+
+That re-encryption is only worth anything if Traefik verifies the backend,
+which is what `01-serverstransport.yaml` is for. A `scheme: https` backend
+without a `ServersTransport` gets you an encrypted, unauthenticated connection —
+the same weakness as `--insecure`, just relocated to the proxy. Hence
+`insecureSkipVerify: false` and an explicit `serverName`.
+
+## Why S2S is passthrough and Web is not
+
+`03-ingressroutetcp-s2s.yaml` uses **TLS passthrough** for forwarder data,
+deliberately. The indexers set `requireClientCert = true`, and mutual TLS cannot
+survive edge termination: if Traefik terminated, Traefik would become the client
+and the indexer would authenticate *Traefik*, not the forwarder. Every forwarder
+would collapse into one identity. Passthrough keeps the client certificate
+end to end.
+
+HEC is different again — it authenticates with a bearer token, not a client
+cert, so terminating and re-encrypting loses no identity and buys you normal
+HTTP routing.
+
+## The stickiness trap
+
+Splunk Web needs **session stickiness**. On a 3-member search head cluster,
+round-robining a logged-in session produces random logouts and blank pages.
+
+This is the real reason the UI routes are `IngressRoute` and not
+`IngressRouteTCP`: passthrough is raw TCP, so Traefik cannot set a cookie and
+cannot do sticky sessions. If you must use passthrough for Splunk Web — for
+example because policy forbids terminating anywhere but the pod — you have to
+either point the route at a single search head, or accept the breakage. The
+`sticky.cookie` block in `02-ingressroute-ui.yaml` is not optional decoration.
+
+## Prerequisites
+
+The S2S route needs a dedicated entrypoint in Traefik's **static** config;
+IngressRouteTCP cannot create one:
+
+```yaml
+entryPoints:
+  websecure:
+    address: ":443"
+  splunk-s2s:
+    address: ":9997"
+```
+
+If you use these Traefik routes, the NLB services in `08-ingest-endpoints.yaml`
+become redundant for external access — Traefik is the front door instead. Keep
+them only if you also want forwarders bypassing Traefik.
+
+`HostSNI` requires the client to send SNI. Splunk forwarders do when configured
+with a server name; if yours do not, use `HostSNI(\`*\`)` on the dedicated
+entrypoint, which matches any connection on that port.
+
+==== FILE: ./traefik/01-serverstransport.yaml ====
+# Tells Traefik how to verify the Splunk backends it re-encrypts to.
+#
+# This is the piece people skip. Without a ServersTransport, Traefik talks
+# HTTPS to the backend but does NOT verify it - the connection is encrypted and
+# unauthenticated, which is the same failure as curl --insecure, just moved.
+#
+# rootCAsSecrets makes Traefik validate the backend cert against our internal
+# CA; serverName makes it check the identity rather than just the chain.
+---
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: splunk-searchhead
+  namespace: splunk
+spec:
+  serverName: splunk-shc-search-head-service.splunk.svc
+  rootCAsSecrets:
+    - splunk-internal-ca
+  # NEVER set insecureSkipVerify: true here. It is the whole point of this file.
+  insecureSkipVerify: false
+---
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: splunk-managers
+  namespace: splunk
+spec:
+  serverName: splunk-mc-monitoring-console-service.splunk.svc
+  rootCAsSecrets:
+    - splunk-internal-ca
+  insecureSkipVerify: false
+
+==== FILE: ./traefik/03-ingressroutetcp-s2s.yaml ====
+# Forwarder ingest (S2S 9997) and HEC (8088) through Traefik.
+#
+# S2S is not HTTP, so it must be IngressRouteTCP. TLS is PASSTHROUGH here, and
+# that is correct: the indexers require a client certificate
+# (requireClientCert = true in inputs.conf), and mutual TLS cannot survive edge
+# termination - Traefik would become the client and the indexer would
+# authenticate Traefik rather than the forwarder. Passthrough keeps the
+# forwarder's identity intact end to end.
+#
+# This requires a dedicated entrypoint on port 9997 in your Traefik static
+# config, e.g.:
+#   entryPoints:
+#     splunk-s2s:
+#       address: ":9997"
+#
+# HostSNI requires the forwarder to send SNI. Splunk forwarders do when
+# configured with a server name; if yours do not, use HostSNI(`*`) on a
+# dedicated entrypoint, which matches any connection on that port.
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRouteTCP
+metadata:
+  name: splunk-s2s
+  namespace: splunk
+spec:
+  entryPoints:
+    - splunk-s2s
+  routes:
+    - match: HostSNI(`ingest.splunk.example.com`)
+      services:
+        - name: splunk-idxc-indexer-service
+          port: 9997
+  tls:
+    passthrough: true
+---
+# HEC is HTTP, so it can be an ordinary IngressRoute with re-encryption.
+# Terminating here is acceptable because HEC authenticates with a bearer token
+# rather than a client certificate, so no peer identity is lost.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: splunk-hec
+  namespace: splunk
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`hec.splunk.example.com`) && PathPrefix(`/services/collector`)
+      services:
+        - name: splunk-idxc-indexer-service
+          port: 8088
+          scheme: https
+          serversTransport: splunk-indexer-hec
+  tls:
+    secretName: splunk-public-tls
+---
+apiVersion: traefik.io/v1alpha1
+kind: ServersTransport
+metadata:
+  name: splunk-indexer-hec
+  namespace: splunk
+spec:
+  serverName: splunk-idxc-indexer-service.splunk.svc
+  rootCAsSecrets:
+    - splunk-internal-ca
+  insecureSkipVerify: false
+
+==== FILE: ./README.md ====
+# Example: full clustered Splunk on EKS with S3
+
+`examples/splunk-cluster-aws-s3/`
+
+Reference deployment for a Splunk Validated Architecture **C3** (distributed clustered
+indexers + search head cluster, single site) on AWS, with S3 for SmartStore and app
+distribution. Manifests in this directory are validated and apply in numeric order.
+
+The operator itself deploys **nothing**. It watches for CRs and reconciles them. After
+`kubectl apply -f splunk-operator-cluster.yaml` you have zero Splunk pods until you
+apply the resources below.
+
+---
+
+## 0. Version provenance
+
+Everything here was verified against **tag `3.1.0`** (commit `85b1dcca`).
+
+The working checkout of `main` is only 5 commits ahead of that tag, and the diff
+touches just three files — `helm-chart/splunk-operator/values.yaml`,
+`pkg/splunk/enterprise/util.go`, and its test. The paths this guide is built on —
+`api/v4/`, `config/crd/bases/`, `config/examples/`, `docs/`, `.env`, and the port and
+label logic in `pkg/splunk/enterprise/{configuration,types,names}.go` — are
+**byte-identical at 3.1.0**. So the CRD fields, scopes, service ports, and pod labels
+below all hold for the 3.1.0 release.
+
+Two version-specific cautions:
+
+- **The Helm chart at 3.1.0 pins `docker.io/splunk/splunk:10.0.0`**, not 10.2.0. The
+  bump to 10.2.0 landed *after* the tag. If you install via Helm at 3.1.0 and take
+  the default, you get Splunk 10.0.0 — which is **too old for the ingestion
+  separation stack in file 07** (`IngestorCluster`/`Queue`/`ObjectStorage` require
+  10.2+). The CRDs are present at 3.1.0 either way, so this fails at runtime, not at
+  apply time. Override the image or pin it per CR.
+- **`RELATED_IMAGE_SPLUNK_ENTERPRISE` in the published release YAML is injected at
+  build time** from a CI secret, and the Makefile's own default is the untagged
+  `docker.io/splunk/splunk`. Do not rely on it. Every CR in this directory sets
+  `image:` explicitly, which is the behaviour you want anyway — it is what gives you
+  control of the upgrade cycle.
+
+---
+
+## 1. What a full cluster consists of
+
+| CR | Count | Pods created | Why you need it |
+|---|---|---|---|
+| `LicenseManager` | 1 | `splunk-lm-license-manager-0` | Central license; every other tier points at it |
+| `ClusterManager` | 1 | `splunk-cm-cluster-manager-0` | Owns SmartStore config, RF/SF, and cluster-wide app bundle |
+| `IndexerCluster` | 1 (3+ peers) | `splunk-idxc-indexer-{0..n}` | Indexes and stores data |
+| `SearchHeadCluster` | 1 (3+ members) | `splunk-shc-deployer-0`, `splunk-shc-search-head-{0..n}` | Search + your dashboards; deployer distributes apps |
+| `MonitoringConsole` | 1 | `splunk-mc-monitoring-console-0` | Health/topology view; auto-wires to every CR referencing it |
+
+Everything above is in the numbered files and is required. Under `optional/`:
+
+`IngestorCluster` + `Queue` + `ObjectStorage` (CRDs present at 3.1.0, but
+the feature requires a Splunk **10.2+** image — see §0) for ingestion
+separation, and a `Standalone` heavy-forwarder tier for syslog.
+
+Order matters only loosely — the operator retries — but license first, then cluster
+manager, then peers, then search heads, is the clean path.
+
+---
+
+## 2. Prerequisites before the first CR
+
+### Namespace and operator scope
+The operator installs into `splunk-operator` and, with the cluster-scoped manifest,
+watches all namespaces. If you use `WATCH_NAMESPACE`, add `splunk` to it.
+
+```bash
+kubectl create namespace splunk
+```
+
+### Splunk General Terms (required for 10.x images, easy to miss)
+Splunk Enterprise 10.x containers will not start unless the operator deployment sets:
+
+```yaml
+- name: SPLUNK_GENERAL_TERMS
+  value: "--accept-sgt-current-at-splunk-com"
+```
+
+It defaults to an **empty string**. At 3.1.0 this env var is injected into the
+deployment by kustomize (`config/default/kustomization.yaml`, placeholder
+`SPLUNK_GENERAL_TERMS_VALUE`) and the Makefile default is `""` — so the published
+`splunk-operator-cluster.yaml` ships it empty. Either pass it at deploy time
+(`make deploy SPLUNK_GENERAL_TERMS="--accept-sgt-current-at-splunk-com"`) or patch
+the running deployment before applying any CR:
+
+```bash
+kubectl -n splunk-operator set env deploy/splunk-operator-controller-manager \
+  SPLUNK_GENERAL_TERMS="--accept-sgt-current-at-splunk-com"
+```
+
+### EBS CSI driver + StorageClass
+`01-storageclass.yaml` defines a gp3 class with `WaitForFirstConsumer` so each EBS
+volume lands in the same AZ as its pod. Requires the `aws-ebs-csi-driver` addon.
+
+### IAM via kiam
+
+This deployment uses **kiam**, not IRSA. The difference matters: kiam authorises
+**pods**, IRSA authorises **service accounts**. So there is no
+`eks.amazonaws.com/role-arn` service account here, and `serviceAccount:` on the CRs
+does nothing for AWS access.
+
+kiam needs authorisation in two places, and both must line up:
+
+| Where | Annotation | Set in |
+|---|---|---|
+| Namespace | `iam.amazonaws.com/permitted: "^SplunkS3Access$"` | `00-namespace.yaml` |
+| Pod | `iam.amazonaws.com/role: SplunkS3Access` | each CR's `metadata.annotations` |
+
+**Why annotating the CR works.** The operator copies the CR's own labels and
+annotations onto the StatefulSet's *pod template* — `AppendParentMeta` in
+`pkg/splunk/enterprise/configuration.go`, called from `getSplunkStatefulSet`, which
+every tier including the SHC deployer goes through. So an annotation on the CR lands
+on the pods, which is exactly what kiam reads. Verified identical at 3.1.0.
+
+Two consequences worth knowing:
+
+- `AppendParentMeta` **will not clobber** an annotation the operator already set on
+  the pod template. `iam.amazonaws.com/role` is not one the operator sets, so it
+  propagates cleanly — but this is why you annotate the CR rather than editing the
+  StatefulSet, which the operator would revert on its next reconcile.
+- Changing the annotation changes the pod template, which **triggers a rolling
+  restart** of that tier. Plan role changes accordingly.
+
+**Do not forget the operator itself.** The App Framework downloads app packages in
+the *operator* pod before copying them into the Splunk pods, so the
+`splunk-operator` namespace and the operator deployment need the same two
+annotations. See `00b-operator-namespace-kiam.yaml`. Missing this is a confusing
+failure: every Splunk tier is healthy and apps simply never install.
+
+Role setup, trust policy, and how to verify credentials are actually reaching the
+pods: see `iam/README.md`.
+
+### Static keys instead
+
+If you would rather not use kiam for the S3 volumes:
+
+```bash
+kubectl -n splunk create secret generic s3-secret \
+  --from-literal=s3_access_key=AKIA... \
+  --from-literal=s3_secret_key=...
+```
+and add `secretRef: s3-secret` to each volume stanza in `04-` and `06-`. The two
+mechanisms are mutually exclusive per volume — a `secretRef` takes precedence and
+kiam credentials are ignored for that volume.
+
+### Buckets
+```
+my-splunk-smartstore/idxc/        # SmartStore warm/cold buckets
+my-splunk-apps/indexer-apps/      # TAs for indexer peers
+my-splunk-apps/cm-apps/           # cluster manager local apps
+my-splunk-apps/search-apps/       # your dashboard apps
+my-splunk-apps/search-tas/        # search-time TAs
+```
+
+### License file
+```bash
+kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic
+```
+
+---
+
+## 3. Storage — why EBS is still required with SmartStore
+
+SmartStore does not replace local disk, it changes what local disk is *for*.
+Every pod still gets two EBS volumes, and both remain required with SmartStore
+enabled. What changes is how big one of them has to be.
+
+### The two volumes
+
+The operator creates two PVCs per pod, always, from
+`pkg/splunk/enterprise/configuration.go`:
+
+| Mount | Default | Spec field | Holds |
+|---|---|---|---|
+| `/opt/splunk/etc` | **10Gi** | `etcVolumeStorageConfig` | Config, installed apps, user objects, dashboards |
+| `/opt/splunk/var` | **100Gi** | `varVolumeStorageConfig` | Hot buckets, SmartStore cache, splunkd logs, search artifacts |
+
+They are `volumeClaimTemplates` on the StatefulSet, so each pod ordinal gets its
+own pair, named `pvc-etc-splunk-<cr>-<tier>-<n>` and `pvc-var-...`.
+
+### Why `/opt/splunk/etc` cannot go to S3
+
+Nothing about it lives in S3, ever. This is the Splunk installation: `system/`,
+`apps/`, `users/`, every `.conf` file, and the dashboards the App Framework
+installed. SmartStore is an *index* storage feature and has no bearing on it.
+
+It is small and slow-growing. 10Gi is fine for most tiers; the search heads get
+more here because user objects and saved searches accumulate.
+
+### Why `/opt/splunk/var` cannot go to S3 either
+
+Three separate reasons, each sufficient on its own.
+
+**1. Hot buckets are always local.** Incoming data is written to a hot bucket on
+local disk and stays there while the bucket is open for writing. Only when the
+bucket rolls to warm does SmartStore upload it to S3. There is no configuration
+that makes Splunk write hot buckets directly to object storage.
+
+The consequence worth internalising: **data in hot buckets is not yet in S3**.
+Lose the volume and you lose whatever had not rolled. This is precisely why
+index replication (RF ≥ 2) still matters with SmartStore — S3 durability does
+not protect the newest data, peer replication does.
+
+**2. Warm buckets are cached locally to be searched.** SmartStore fetches a
+bucket from S3 onto local disk before it can be searched. Undersize this volume
+and searches thrash: every query faults buckets down, evicting others the next
+query re-fetches. It shows up as slow searches and heavy S3 GET charges rather
+than as an error. Sizing detail in the next section.
+
+**3. Everything else splunkd writes is local.** The dispatch directory (search
+artifacts and results), splunkd logs, and the KV store on search heads.
+
+### What is actually on `/opt/splunk/var`, in detail
+
+#### Hot buckets
+
+A **bucket** is a directory of indexed data covering a time range. Buckets have
+a lifecycle, and **hot** is the only stage that is open for writing:
+
+```
+hot ──roll──> warm ──upload──> S3        (SmartStore)
+ │
+ └─ local, being written to, NOT yet in S3
+```
+
+Incoming events land in a hot bucket on local disk. It rolls to warm when
+**either** limit is hit, whichever comes first:
+
+| Setting | Meaning | Common value |
+|---|---|---|
+| `maxDataSize` | Size cap per bucket | `auto` = 750MB, `auto_high_volume` = 10GB |
+| `maxHotSpanSecs` | Time span per bucket | varies |
+
+A restart also rolls hot buckets. On roll, SmartStore uploads the bucket to S3
+and it becomes a cache entry like any other.
+
+**How much space:** roughly
+`number of indexes × maxHotBuckets per index × maxDataSize`. With a handful of
+indexes at `auto_high_volume` and a few hot buckets each, that is tens of GB,
+not hundreds. It is the smaller part of `var`.
+
+**Why it matters more than its size:** hot buckets are the data **not yet in
+S3**. Object-storage durability does nothing for them. This is the whole reason
+`replication_factor: 2` is still set in `04-clustermanager.yaml` — peer
+replication is what protects data between arrival and upload.
+
+#### SmartStore cache — how much?
+
+There is no "cache size" you set to a number and forget. The cache manager
+evicts when **either** condition is met:
+
+```
+occupied space  >  max_cache_size
+        ...OR...
+partition free space  <  (minFreeSpace + eviction_padding)
+```
+
+`max_cache_size = 0` disables the first rule, leaving only the free-space rule —
+so the cache grows until the partition is nearly full, then evicts LRU. That is
+the usual choice when the volume is dedicated to Splunk, which it is here.
+
+**In practice the cache is "whatever is left on the volume."** You do not size
+the cache; you size the volume, and the cache manager fills it. A `var` of 500Gi
+with ~50GB of hot buckets and overhead gives roughly 400GB+ of usable cache.
+
+Protected from eviction regardless:
+
+| CR setting | server.conf | What it protects |
+|---|---|---|
+| `hotlistRecencySecs: 86400` | `hotlist_recency_secs` | Buckets newer than 24h stay resident |
+| `hotlistBloomFilterRecencyHours: 360` | `hotlist_bloom_filter_recency_hours` | Bloom filters kept 15 days — they let Splunk skip buckets without downloading them |
+
+The bloom filter setting is the cheap win: keeping filters far longer than the
+data means a search over old data rejects irrelevant buckets without faulting
+them down from S3 at all.
+
+**Operator gotcha:** the operator only writes a `[cachemanager]` setting when it
+is **non-zero** — see `GetServerConfigEntries` in
+`pkg/splunk/enterprise/configuration.go`. So setting `maxCacheSize: 0` in the CR
+does **not** write `max_cache_size = 0`; it writes nothing and leaves Splunk's
+built-in default in force. If you need the value set explicitly, confirm what
+your build actually defaults to and, if it is not what you want, ship it in a
+custom app rather than through the CR.
+
+Verify what is really in effect:
+
+```bash
+kubectl -n splunk exec splunk-idxc-indexer-0 -- \
+  /opt/splunk/bin/splunk btool server list cachemanager --debug
+kubectl -n splunk exec splunk-idxc-indexer-0 -- \
+  /opt/splunk/bin/splunk btool server list diskUsage --debug   # minFreeSpace
+```
+
+#### splunkd logs
+
+`$SPLUNK_HOME/var/log/splunk/` — `splunkd.log`, `metrics.log`, audit and
+introspection logs. These rotate with size caps, so the footprint is bounded and
+modest: a few GB per pod. Not a sizing factor, but it shares the volume, so a
+full `var` also means splunkd cannot write its own logs.
+
+#### Search artifacts
+
+`$SPLUNK_HOME/var/run/splunk/dispatch/` — one directory per search job holding
+results and metadata. Bounded by two things: a TTL after which the job is
+reaped, and `srchDiskQuota` per role.
+
+Largest on **search heads**, where interactive and scheduled searches run. On
+indexers the peers keep their portion of distributed searches, which is smaller.
+This is why the search heads here get 100Gi of `var` despite indexing nothing.
+
+### So what does SmartStore actually save
+
+Sizing shifts from **retention** to **working set**.
+
+Without SmartStore, `/opt/splunk/var` must hold every bucket you intend to keep
+searchable — retention period × daily volume × replication factor. With
+SmartStore it holds hot buckets plus the cache: roughly the data people
+actually search, usually recent.
+
+That is why `05-indexercluster.yaml` asks for 500Gi rather than the multi-TB a
+non-SmartStore cluster of the same retention would need. The retention lives in
+`my-splunk-smartstore/idxc/`.
+
+**S3 = durable long-term retention. EBS = hot tier + cache.**
+
+### Not to be confused with
+
+**`ObjectStorage`** (the CRD, in `optional/ingestion-separation.yaml`) is not
+SmartStore and not bucket storage. It is the overflow location for ingestion
+queue messages too large for SQS, used only by the 10.2+ ingestion separation
+feature. It replaces neither SmartStore nor EBS.
+
+**The operator's `app-download` PVC** is a third, unrelated volume in the
+`splunk-operator` namespace, where the App Framework stages app packages before
+copying them into pods. See §6 of `README.md`.
+
+### Sizing per tier
+
+What the manifests here request, and why:
+
+| Tier | etc | var | Reasoning |
+|---|---|---|---|
+| Cluster Manager | 20Gi | 50Gi | Holds the app bundle; indexes nothing |
+| Indexer | 15Gi | **500Gi** | Hot buckets + SmartStore cache — size to working set |
+| Search Head | 30Gi | 100Gi | User objects and saved searches in etc; dispatch dir in var |
+| License Manager | 10Gi | 20Gi | Minimal |
+| Monitoring Console | 10Gi | 20Gi | Minimal |
+
+Indexer `var` is the number worth calculating rather than copying. Start from
+the volume of data searched in a typical window, not total retention, and leave
+headroom for hot buckets and eviction padding.
+
+### StorageClass choices
+
+`01-storageclass.yaml` uses gp3 with:
+
+```yaml
+volumeBindingMode: WaitForFirstConsumer
+```
+
+This matters on EKS. EBS volumes are zonal: a volume in `us-east-1a` cannot
+attach to a pod in `us-east-1b`. `WaitForFirstConsumer` defers provisioning
+until the scheduler picks a node, so the volume is created in the right zone.
+With the default `Immediate` binding, a volume can be created in a zone the pod
+cannot be scheduled into, and the pod hangs `Pending` forever.
+
+```yaml
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+```
+
+`Retain` keeps the underlying volume when a PVC is deleted — deliberate for
+indexed data. `allowVolumeExpansion` lets you grow a volume in place later;
+without it, resizing means recreating the pod's storage.
+
+IOPS and throughput are set well above gp3 defaults because indexing is
+write-heavy and cache faulting is read-heavy. Raise them for indexers before
+raising capacity if searches are slow but the cache is not full.
+
+### Two things that delete data
+
+**The `delete-pvc` finalizer.** Every CR here carries:
+
+```yaml
+finalizers:
+  - enterprise.splunk.com/delete-pvc
+```
+
+This is convenient in test and destructive in production: deleting the CR
+deletes the PVCs, and with them the indexed data. `reclaimPolicy: Retain` keeps
+the EBS volume itself, but it is then unattached and unreferenced. **Remove this
+finalizer for a production cluster** unless you specifically want
+`kubectl delete` to reclaim storage.
+
+**`ephemeralStorage: true`.** Both storage configs accept it, which swaps the
+PVC for an `emptyDir` — data lives and dies with the pod. Only ever for testing.
+The CRD enforces that it is mutually exclusive with `storageClassName` and
+`storageCapacity`.
+
+### Pre-provisioned volumes
+
+If your platform team creates PVs rather than letting the CSI driver provision
+them, annotate the CR:
+
+```yaml
+metadata:
+  annotations:
+    enterprise.splunk.com/admin-managed-pv: "true"
+```
+
+The operator then clears `storageClassName` and builds the claim with a label
+selector instead, binding to PVs you created and labelled to match. Without the
+annotation it always requests dynamic provisioning.
+
+### Checking
+
+```bash
+kubectl -n splunk get pvc -o custom-columns=\
+NAME:.metadata.name,SIZE:.spec.resources.requests.storage,SC:.spec.storageClassName,STATUS:.status.phase
+
+# Actual usage inside a pod
+kubectl -n splunk exec splunk-idxc-indexer-0 -- df -h /opt/splunk/etc /opt/splunk/var
+```
+
+Watch `/opt/splunk/var` on the indexers. Steady growth toward full is normal
+with SmartStore — the cache fills and then evicts. Sustained 100% with slow
+searches means the working set exceeds the cache, so grow the volume or tighten
+`hotlistRecencySecs`.
+
+## 4. Getting your existing dashboards in
+
+Dashboards are just apps. The App Framework polls an S3 prefix and installs what it
+finds, so the workflow is: package → upload → reference in `appRepo`.
+
+### Package
+Your app directory needs the standard layout; dashboards are XML under
+`default/data/ui/views/`:
+
+```
+my_dashboards/
+├── default/
+│   ├── app.conf
+│   └── data/ui/views/*.xml        # dashboards
+│   └── data/ui/nav/default.xml    # nav menu
+├── local/                          # leave empty in the package
+└── metadata/default.meta           # set export = system for global visibility
+```
+
+```bash
+tar -czf my_dashboards.tgz my_dashboards/
+aws s3 cp my_dashboards.tgz s3://my-splunk-apps/search-apps/
+```
+
+Exporting an existing app from a running Splunk instance works too — grab
+`$SPLUNK_HOME/etc/apps/<app>` and tar it. Strip `local/` overrides you do not want
+frozen into the package, since on a search head cluster the deployer overwrites
+member-local changes.
+
+### Where each app goes
+
+| Put it in | Via | Lands on |
+|---|---|---|
+| Dashboards, search-time knowledge objects | `SearchHeadCluster.appRepo`, `scope: cluster` | Deployer `etc/shcluster/apps` → all members |
+| Deployer-only app | `SearchHeadCluster.appRepo`, `scope: local` | Deployer `etc/apps` |
+| Index-time TAs (props/transforms) | `ClusterManager.appRepo`, `scope: cluster` | CM `etc/manager-apps` → bundle push → peers `etc/peer-apps` |
+| CM-only app | `ClusterManager.appRepo`, `scope: local` | CM `etc/apps` |
+
+`IndexerCluster` has **no** `appRepo` field — that is intentional, not an omission.
+Indexer apps always go through the ClusterManager bundle.
+
+An app needed on both the deployer and the members must appear twice in `appSources`
+with **different names but the same location** and different scopes — see
+`deployerLocalApps` in `06-searchheadcluster.yaml`.
+
+### Updates
+`appsRepoPollIntervalSeconds: 900` re-checks S3 every 15 min and installs changes.
+To push immediately, patch the auto-created configmap:
+
+```bash
+kubectl -n splunk patch cm splunk-splunk-manual-app-update \
+  --type=merge -p '{"data":{"shc":"status: off\nrefCount: 0"}}'
+```
+
+Verify:
+```bash
+kubectl -n splunk get shc shc -o jsonpath='{.status.appContext.appsSrcDeployStatus}' | jq
+```
+
+---
+
+## 5. Ingest points
+
+The operator exposes **9997 (S2S)** and **8088 (HEC)** only on `Standalone`,
+`IndexerCluster`, `MonitoringConsole`, and `IngestorCluster` services. Cluster manager,
+search head, and deployer services expose only 8000/8089 — do not point forwarders
+at them.
+
+```
+splunk-idxc-indexer-service    8000, 8088, 8089, 9997   <- ingest target
+splunk-idxc-indexer-headless   8000, 8088, 8089, 9997
+splunk-shc-search-head-service 8000, 8089
+splunk-cm-cluster-manager-service 8000, 8089
+```
+
+### From outside the cluster
+`08-ingest-endpoints.yaml` puts an internal NLB in front of the indexer pods for both
+9997 and 8088.
+
+**Indexer Discovery does not work on Kubernetes.** Forwarders cannot query the cluster
+manager for a peer list; they must target the load balancer. The LB must resolve to
+**two or more IPs**, otherwise forwarder auto-load-balancing collapses onto one peer.
+Cross-zone NLB with `target-type: ip` gives you that.
+
+Forwarder `outputs.conf`:
+```ini
+[tcpout]
+defaultGroup = k8s_indexers
+
+[tcpout:k8s_indexers]
+server = splunk-ingest.internal.example.com:9997
+autoLBFrequency = 30
+forceTimebasedAutoLB = true
+```
+
+### HEC
+The HEC token is generated into the namespace-wide secret:
+
+```bash
+kubectl -n splunk get secret splunk-splunk-secret -o jsonpath='{.data.hec_token}' | base64 -d
+```
+
+```bash
+curl -k https://splunk-ingest-hec.internal.example.com:8088/services/collector/event \
+  -H "Authorization: Splunk <hec_token>" \
+  -d '{"event":"hello","index":"main","sourcetype":"manual"}'
+```
+
+Pre-seed the token instead of taking the generated one by creating
+`splunk-splunk-secret` with a `hec_token` key **before** the first CR.
+
+### TLS
+Convention in the Splunk docs is to keep 9997 plaintext for intra-cluster traffic and
+add a second port (9998) for TLS from outside, via `serviceTemplate` on the CR:
+
+```yaml
+spec:
+  serviceTemplate:
+    spec:
+      type: LoadBalancer
+      ports:
+        - name: tls-s2s
+          port: 9998
+          targetPort: 9998
+          protocol: TCP
+```
+
+`serviceTemplate` is applied by the operator to the regular service only (not the
+headless one), and the operator overwrites `selector` with the correct labels — so
+this is safer than hand-writing a Service. See `docs/Ingress.md` for Istio and NGINX
+gateway configurations including end-to-end TLS and TLS termination.
+
+### Syslog / other sources
+Nothing in the operator terminates syslog. Run a `Standalone` CR as a heavy forwarder
+tier, or an independent collector (e.g. Splunk Connect for Syslog) writing to the HEC
+endpoint above.
+
+---
+
+## 6. Operator app-staging volume
+
+The operator stages downloaded app packages on a PVC mounted at
+`/opt/splunk/appframework/`. **You do not create this** — at 3.1.0 the release
+manifest ships it, because `config/default` includes `../persistent-volume` in its
+bases. The shipped object is:
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-download          # in the splunk-operator namespace
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+Two things to check, because both bite silently:
+
+1. **It declares no `storageClassName`**, so it binds via your cluster's *default*
+   StorageClass. EKS clusters often have no default. If none exists the PVC stays
+   `Pending`, and because the mount is unconditional in the deployment, the
+   **operator pod never starts**. Either mark a class default or patch the PVC:
+
+   ```bash
+   kubectl -n splunk-operator get pvc app-download
+   kubectl -n splunk-operator get sc    # look for (default)
+   ```
+
+2. **10Gi is the default size and it is not resizable in place** unless your
+   StorageClass sets `allowVolumeExpansion`. Size it up front if your app set is
+   large — the framework stages every package it downloads before installing.
+
+## 7. Apply
+
+Contents of this directory:
+
+```
+00-namespace.yaml                  Namespace, kiam permitted-role regex
+00b-operator-namespace-kiam.yaml   Notes: kiam wiring for the operator itself
+01-storageclass.yaml               gp3 class, WaitForFirstConsumer
+02-license-configmap.yaml.template NOT appliable - generate from your .lic
+03-licensemanager.yaml             LicenseManager
+04-clustermanager.yaml             ClusterManager + SmartStore(S3) + indexer apps
+05-indexercluster.yaml             IndexerCluster (3 peers)
+06-searchheadcluster.yaml          SearchHeadCluster (deployer + 3) + dashboards
+07-monitoringconsole.yaml          MonitoringConsole
+08-ingest-endpoints.yaml           NLB services for S2S 9997 + HEC 8088
+09-poddisruptionbudgets.yaml       One indexer / one search head down at a time
+10-karpenter-nodepool.yaml         Node pool + disruption budgets (cluster-scoped)
+kustomization.yaml                 kubectl apply -k . (see caveat in the file)
+iam/                               IAM policies + kiam trust policy + README
+optional/ingestion-separation.yaml Queue + ObjectStorage + IngestorCluster (10.2+)
+optional/heavy-forwarder-syslog.yaml Standalone HF tier for syslog
+```
+
+Edit before applying: the role name in `00-namespace.yaml` and each CR's
+`iam.amazonaws.com/role`, `<ACCOUNT_ID>` and `<KIAM_SERVER_NODE_ROLE>` in `iam/*`, the bucket names and
+region throughout `04-*` and `06-*`, and the LB hostnames in `08-*`.
+
+First bring-up, in order:
+
+```bash
+# Prereqs: operator installed, SPLUNK_GENERAL_TERMS patched, buckets + IRSA role created
+kubectl apply -f 00-namespace.yaml
+kubectl apply -f 01-storageclass.yaml
+kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic
+kubectl apply -f 03-licensemanager.yaml
+kubectl apply -f 04-clustermanager.yaml
+
+# Let the CM settle before the peers - it owns the bundle they pull.
+kubectl -n splunk wait --for=jsonpath='{.status.phase}'=Ready clustermanager/cm --timeout=15m
+
+kubectl apply -f 05-indexercluster.yaml
+kubectl apply -f 06-searchheadcluster.yaml
+kubectl apply -f 07-monitoringconsole.yaml
+kubectl apply -f 08-ingest-endpoints.yaml
+kubectl apply -f 09-poddisruptionbudgets.yaml
+
+# Cluster-scoped; apply if Karpenter manages these nodes
+kubectl apply -f 10-karpenter-nodepool.yaml
+```
+
+Watch:
+```bash
+kubectl -n splunk get pods -w
+kubectl -n splunk get clustermanager,indexercluster,searchheadcluster,licensemanager,monitoringconsole
+```
+
+Expected steady state — 9 pods:
+```
+splunk-lm-license-manager-0        splunk-cm-cluster-manager-0
+splunk-idxc-indexer-0..2           splunk-shc-deployer-0
+splunk-shc-search-head-0..2        splunk-mc-monitoring-console-0
+```
+
+Admin password:
+```bash
+kubectl -n splunk get secret splunk-splunk-secret -o jsonpath='{.data.password}' | base64 -d
+```
+
+Splunk Web:
+```bash
+kubectl -n splunk port-forward service/splunk-shc-search-head-service 8000
+```
+
+## 8. Things that bite
+
+- **`SPLUNK_GENERAL_TERMS` empty** → 10.x pods never start. Most common failure.
+- **The `finalizers: enterprise.splunk.com/delete-pvc` entry** deletes PVCs when the
+  CR is deleted. Convenient in test, destructive in production. Remove it if you want
+  PVCs to survive a `kubectl delete`.
+- **SmartStore on the wrong CR.** Only `ClusterManager` and `Standalone` accept a
+  `smartstore` stanza. Putting it on `IndexerCluster` silently does nothing.
+- **Migrating existing indexes to SmartStore** requires a data migration *before* you
+  list them in the CR — you cannot just add an existing index to the stanza.
+- **Custom apps can override SmartStore settings.** The operator writes config into an
+  app named `splunk-operator`; a higher-precedence app with its own `indexes.conf`
+  wins. Keep index/volume definitions out of your custom apps.
+- **Changing admin passwords via Splunk UI/CLI breaks the operator.** Change them in
+  `splunk-splunk-secret` only.
+- **`queueRef` / `objectStorageRef` are immutable.** Decide on ingestion separation
+  before creating the IndexerCluster.
+- **Scaling down a SearchHeadCluster below 3** is not valid Splunk clustering.
+- **The in-repo `config/examples/advanced/c3.yaml` and `c1.yaml` do not parse at 3.1.0** — the
+  `smartstore.volumes` list is misindented. Confirmed by parsing the blobs straight
+  from the tag. Use the manifests here instead.
+
+---
+
+## 9. Placement, disruption and Karpenter
+
+Three separate mechanisms, each covering something the others cannot.
+
+### Separate nodes is enforced, not preferred
+
+The operator already adds a podAntiAffinity term on `kubernetes.io/hostname`,
+but only as **PreferredDuringScheduling** (`AppendPodAntiAffinity` in
+`pkg/splunk/common/util.go`). Preferred is best-effort — under capacity
+pressure the scheduler stacks two peers on one node, and one node failure then
+takes out two replicas.
+
+`05-indexercluster.yaml` and `06-searchheadcluster.yaml` add a
+**RequiredDuringScheduling** term, which is what actually enforces it. The
+operator appends its Preferred term to whatever the CR sets rather than
+replacing it, so both land on the pod.
+
+The cost is deliberate: you need at least as many schedulable nodes as
+replicas, in the right AZs, and a replica with nowhere to go stays `Pending`
+rather than doubling up.
+
+AZ spread stays **soft**. Hard zone spread would strand pods whenever a zone is
+tight, and EBS volumes are zonal anyway so a replacement must return to its
+original AZ regardless.
+
+### A PDB cannot bring the new pod up first
+
+This is worth being blunt about, because it is the usual expectation and it is
+not achievable:
+
+- A PDB does not sequence anything. It only answers "would evicting this pod
+  leave too few available?" and refuses if so.
+- A StatefulSet allows **one pod per ordinal**. There cannot be two
+  `splunk-idxc-indexer-1`.
+- The PVC is ReadWriteOnce and EBS attaches to one node at a time. The old pod
+  must terminate and detach before the replacement can attach.
+
+So the replacement necessarily reuses the original volume and its data — that
+part of your instinct is exactly right, and it has to happen in that order.
+
+What protects the data is **Splunk replication, not Kubernetes**. With
+`replication_factor: 2`, one peer down leaves every bucket with a copy. The
+PDB's only job is to ensure exactly one goes at a time.
+
+That matters more here than usual: the operator sets
+`PodManagementPolicy: Parallel`, so the StatefulSet will **not** serialise
+replacement. Without `09-poddisruptionbudgets.yaml`, a single node drain can
+take several peers at once.
+
+| Tier | PDB | Why |
+|---|---|---|
+| Indexers | `maxUnavailable: 1` | 2 down can lose both copies of a bucket at RF=2 |
+| Search heads | `maxUnavailable: 1` | Keeps the UI up and preserves captain majority (2 of 3) |
+| CM / LM / MC / deployer | **none** | See below |
+
+`maxUnavailable` rather than `minAvailable` so the budget stays correct when
+you scale. At 5 search heads, `minAvailable: 2` would permit 3 down and break
+quorum; `maxUnavailable: 1` does not.
+
+**No PDBs on the singletons.** A one-replica tier with `minAvailable: 1` can
+never satisfy an eviction, so Karpenter and `kubectl drain` block on that node
+forever. That is not high availability, it is a stuck cluster. Those tiers
+tolerate a restart — while the cluster manager is down, indexing and search
+continue, it just cannot push bundles. To protect one during a specific window,
+annotate the pod instead and remove it afterwards:
+
+```yaml
+metadata:
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"
+```
+
+Set on the CR, which the operator copies to the pod template.
+
+### Karpenter needs more than PDBs
+
+Two gaps PDBs do not close, both handled in `10-karpenter-nodepool.yaml`:
+
+- **`terminationGracePeriod` on the NodePool is a hard deadline.** When set,
+  Karpenter force-terminates the node when it expires, PDBs and all. It is
+  deliberately left unset so the PDBs are honoured.
+- **PDBs only gate voluntary disruption.** Spot reclamation, hardware failure
+  and crashes ignore them. That is what `replication_factor` is for — and why
+  the NodePool is on-demand only.
+
+`disruption.budgets` caps concurrent node disruption before per-pod PDBs even
+apply, and `consolidationPolicy: WhenEmpty` stops Karpenter repacking stateful
+pods for bin-packing, where every move costs a volume detach/attach and a
+Splunk restart.
+
+**The zonal trap:** a replacement pod must return to its PVC's AZ. If the
+NodePool cannot provision there — zone missing from `requirements`, or capacity
+exhausted — the pod stays `Pending` with its data intact but unreachable. List
+every AZ your volumes live in.
+
+## 10. Multisite
+
+For bucket replicas spread across AZs with site awareness, use one `IndexerCluster`
+per AZ pointing at a shared `ClusterManager`, each with a hardcoded `site` and zone
+affinity. See `docs/MultisiteExamples.md`. The single-site C3 here relies on
+`topologySpreadConstraints` for AZ spread, which gives you scheduling spread but not
+site-aware bucket placement.
+
+---
+
+## 11. TLS and external access
+
+Two directories cover this, each with its own README:
+
+- **`tls/`** — cert-manager issuers and per-tier certificates, a Splunk conf app
+  that turns on peer verification, and replacement health-probe scripts.
+- **`traefik/`** — IngressRoute / IngressRouteTCP for the UIs, forwarder ingest
+  and HEC.
+
+Three things worth knowing before you read them:
+
+**Every pod has a UI.** The operator gives port 8000 to every instance type, so
+all 9 pods serve Splunk Web. Only three are worth exposing — search heads,
+monitoring console, cluster manager. Port-forward the rest.
+
+**splunkd is already TLS, and that is not as good as it sounds.** Port 8089 uses
+Splunk's shipped certificates, whose private keys are in every Splunk
+distribution. Verification against that CA proves nothing. Replacing it is the
+point of `tls/`.
+
+**`sslVerifyServerCert` alone is not authentication.** It checks that the peer's
+cert chains to your CA, not that the peer is who you dialled. Pair it with
+`sslVerifyServerName` (or `sslCommonNameToCheck` on the forwarding side) or any
+cert your CA ever issued will be accepted from any host.
+
+The operator's own probe scripts use `curl --insecure`. `tls/probes/` replaces
+all three with versions that validate against the internal CA and fail closed.
+Install the ConfigMap **before the first CR in the namespace** — the operator
+creates it with defaults if absent and never overwrites it afterwards.
+
+## 12. User login
+
+Client certificates authenticate **machines**, not people — there is no x509
+user login for Splunk Web, and no OIDC authorization-code flow either. Splunk's
+SSO story is **SAML 2.0**.
+
+`auth/` configures SAML against Keycloak: the browser presents its certificate
+to Keycloak, which validates it and issues a signed assertion to Splunk. Only
+the Keycloak hostname prompts for a certificate, and Splunk needs no knowledge
+of how the user proved who they are.
+
+**Leave the local `admin` account working** — the operator authenticates as
+`admin` with the password from `splunk-<ns>-secret` to push bundles and manage
+the cluster.
+
+==== FILE: ./08-ingest-endpoints.yaml ====
+# Data ingest endpoints.
+#
+# Indexer pods already expose 9997 (S2S) and 8088 (HEC) on the operator-created
+# ClusterIP service "splunk-idxc-indexer-service". These two objects put an AWS NLB
+# in front of that so forwarders and HEC clients outside the cluster can reach it.
+#
+# Indexer Discovery does NOT work on Kubernetes. Forwarders must target the LB,
+# and the LB must resolve to >= 2 IPs so forwarder auto-LB still distributes data.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-ingest-s2s
+  namespace: splunk
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: s2s
+      port: 9997
+      targetPort: 9997
+      protocol: TCP
+  # Matches the labels the operator puts on indexer pods.
+  # part-of uses the ClusterManager name ("cm"), not the IndexerCluster name.
+  selector:
+    app.kubernetes.io/managed-by: splunk-operator
+    app.kubernetes.io/component: indexer
+    app.kubernetes.io/name: indexer
+    app.kubernetes.io/part-of: splunk-cm-indexer
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-ingest-hec
+  namespace: splunk
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-type: external
+    service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internal
+    service.beta.kubernetes.io/aws-load-balancer-cross-zone-load-balancing-enabled: "true"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: hec
+      port: 8088
+      targetPort: 8088
+      protocol: TCP
+  selector:
+    app.kubernetes.io/managed-by: splunk-operator
+    app.kubernetes.io/component: indexer
+    app.kubernetes.io/name: indexer
+    app.kubernetes.io/part-of: splunk-cm-indexer
+
+==== FILE: ./01-storageclass.yaml ====
+# gp3 StorageClass for Splunk's two EBS volumes per pod.
+# SmartStore does NOT remove the need for these: /opt/splunk/etc holds config+apps,
+# and /opt/splunk/var holds hot buckets (always local) plus the SmartStore cache.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: splunk-gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  # Hot buckets + cache churn; raise iops/throughput for heavy indexing tiers.
+  iops: "6000"
+  throughput: "250"
+  encrypted: "true"
+reclaimPolicy: Retain
+allowVolumeExpansion: true
+# WaitForFirstConsumer keeps the EBS volume in the same AZ as the pod that claims it.
+volumeBindingMode: WaitForFirstConsumer
+
+==== FILE: ./07-monitoringconsole.yaml ====
+# MonitoringConsole - auto-discovers every CR in the namespace that sets
+# monitoringConsoleRef: {name: mc}. Deploy it even if you start it empty.
+apiVersion: enterprise.splunk.com/v4
+kind: MonitoringConsole
+metadata:
+  name: mc
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  # cert-manager secret mounted at /mnt/splunk-tls (operator mounts custom
+  # volumes at /mnt/<name> in every container). tls-combined.pem is the
+  # key+cert file Splunk's serverCert wants; ca.crt is what the verifying
+  # probes and peer checks validate against.
+  volumes:
+    - name: splunk-tls
+      secret:
+        secretName: splunk-manager-tls
+        defaultMode: 0400
+    - name: splunk-public-tls
+      secret:
+        secretName: splunk-public-tls
+        defaultMode: 0400
+  extraEnv:
+    # Splunk Web over TLS. Probes target 8089, not 8000, so this does not
+    # affect health checking.
+    - name: SPLUNK_HTTP_ENABLESSL
+      value: "true"
+    # Consumed by the verifying probe scripts in tls/probes/.
+    - name: SPLUNK_TLS_CA_PATH
+      value: /mnt/splunk-tls/ca.crt
+  image: splunk/splunk:10.2.0
+  licenseManagerRef:
+    name: lm
+  clusterManagerRef:
+    name: cm
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 20Gi
+
+==== FILE: ./02-license-configmap.yaml.template ====
+# NOT directly appliable - a license file cannot be committed to git.
+# Generate the real ConfigMap from your enterprise.lic:
+#
+#   kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic
+#
+# For multiple licenses:
+#   kubectl -n splunk create configmap splunk-licenses \
+#     --from-file=enterprise1.lic --from-file=enterprise2.lic
+# then set licenseUrl on the LicenseManager to the comma-separated paths:
+#   licenseUrl: "/mnt/licenses/enterprise1.lic,/mnt/licenses/enterprise2.lic"
+#
+# The resulting object looks like this:
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: splunk-licenses
+  namespace: splunk
+data:
+  enterprise.lic: |
+    <contents of your Splunk Enterprise license file>
+
+==== FILE: ./09-poddisruptionbudgets.yaml ====
+# Pod disruption budgets for the clustered tiers.
+#
+# READ THIS FIRST — a PDB cannot do what people usually want it to do.
+#
+# A PDB does NOT sequence anything. It cannot say "bring the replacement up
+# before taking the old one down." All it does is answer one question when
+# something asks to evict a pod: "would this leave too few available?" — and if
+# so, refuse the eviction until the count recovers.
+#
+# For a StatefulSet, "new pod first" is impossible regardless of PDB:
+#   1. StatefulSet guarantees at most ONE pod per ordinal. There cannot be two
+#      splunk-idxc-indexer-1 at the same time.
+#   2. The PVC is ReadWriteOnce and belongs to that ordinal. An EBS volume
+#      attaches to one node at a time, so the old pod must terminate and detach
+#      before the replacement can attach and start.
+#
+# So the replacement necessarily reuses the original pod's volume and its data,
+# which is the behaviour you want — it just has to happen in that order.
+#
+# What actually protects the data is Splunk's own replication: with
+# replication_factor 2, one peer being down still leaves every bucket with a
+# copy. The PDB's job is simply to guarantee that only ONE goes at a time.
+#
+# This matters more here than usual, because the operator sets
+# PodManagementPolicy: Parallel on its StatefulSets (see getSplunkStatefulSet).
+# The StatefulSet will NOT serialise replacement for you. Without these PDBs,
+# a node drain can take multiple peers simultaneously.
+---
+# Indexers: at most one peer down at a time.
+#
+# maxUnavailable rather than minAvailable so the budget stays correct when you
+# scale replicas. With replication_factor 2, one peer down leaves every bucket
+# with at least one copy; two down can lose both copies of some bucket, which
+# is the data loss this prevents.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: splunk-idxc-indexer
+  namespace: splunk
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: splunk-idxc-indexer
+---
+# Search heads: at most one member down, which keeps the UI available and
+# preserves the SHC captain majority.
+#
+# With 3 members, losing 1 leaves 2 — still a majority, so the cluster can hold
+# or elect a captain and users keep a working UI on the remaining members.
+# Losing 2 of 3 breaks quorum: no captain, no scheduled searches, degraded UI.
+#
+# maxUnavailable: 1 stays correct if you scale up. minAvailable: 2 would not —
+# at 5 members it would permit 3 down, which breaks quorum.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: splunk-shc-search-head
+  namespace: splunk
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: splunk-shc-search-head
+---
+# NOTE ON THE SINGLETONS — cluster manager, license manager, monitoring
+# console, deployer — there are deliberately NO PDBs for them.
+#
+# A one-replica tier with minAvailable: 1 (or maxUnavailable: 0) can never
+# satisfy an eviction, so Karpenter and `kubectl drain` block forever on that
+# node. You do not get high availability, you get a stuck cluster.
+#
+# These tiers tolerate a brief restart: while the cluster manager is down the
+# indexers keep indexing and searches keep running, it just cannot push bundles
+# or admit new peers. If you need to protect one during a specific maintenance
+# window, annotate the POD instead so Karpenter skips it entirely, and remove
+# the annotation afterwards:
+#
+#   karpenter.sh/do-not-disrupt: "true"
+#
+# Set it via the CR's metadata.annotations, which the operator copies onto the
+# pod template (AppendParentMeta). Leaving it on permanently blocks node
+# recycling and upgrades.
+
+==== FILE: ./kustomization.yaml ====
+# Convenience only. Kustomize sorts by kind and does NOT guarantee ordering
+# between custom resources, so for a FIRST bring-up apply the numbered files in
+# order instead (see README §7) and wait for the ClusterManager to reach Ready
+# before the IndexerCluster. The operator retries, so an out-of-order apply
+# converges eventually - it is just slower and noisier to debug.
+#
+# Good for: re-applying a known-good cluster, diffing, or GitOps once stable.
+#   kubectl apply -k .
+#
+# Not included: 02-license-configmap.yaml.template (generate it from your .lic),
+# 10-karpenter-nodepool.yaml (cluster-scoped, likely managed separately from
+# this namespace), and anything under optional/.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace.yaml
+  - 01-storageclass.yaml
+  - 03-licensemanager.yaml
+  - 04-clustermanager.yaml
+  - 05-indexercluster.yaml
+  - 06-searchheadcluster.yaml
+  - 07-monitoringconsole.yaml
+  - 08-ingest-endpoints.yaml
+  - 09-poddisruptionbudgets.yaml
+
+==== FILE: ./iam/TRUST-POLICY-kiam.json ====
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KiamServerMayAssumeThisRole",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::<ACCOUNT_ID>:role/<KIAM_SERVER_NODE_ROLE>"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+
+==== FILE: ./iam/splunk-ingestion-separation-policy.json ====
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "IngestQueue",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:SendMessage",
+        "sqs:SendMessageBatch",
+        "sqs:ReceiveMessage",
+        "sqs:DeleteMessage",
+        "sqs:DeleteMessageBatch",
+        "sqs:GetQueueUrl",
+        "sqs:GetQueueAttributes",
+        "sqs:ChangeMessageVisibility"
+      ],
+      "Resource": [
+        "arn:aws:sqs:us-east-1:<ACCOUNT_ID>:splunk-ingest",
+        "arn:aws:sqs:us-east-1:<ACCOUNT_ID>:splunk-ingest-dlq"
+      ]
+    },
+    {
+      "Sid": "LargeMessageOverflowBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": "arn:aws:s3:::my-splunk-ingest-overflow/*"
+    },
+    {
+      "Sid": "LargeMessageOverflowBucketList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": "arn:aws:s3:::my-splunk-ingest-overflow"
+    }
+  ]
+}
+
+==== FILE: ./iam/README.md ====
+# IAM for kiam
+
+kiam is **not** IRSA. There is no OIDC provider and no service account in the
+trust path. Instead the kiam agent intercepts pod calls to the EC2 metadata
+endpoint, and the kiam **server** — running on its own nodes — assumes the role
+on the pod's behalf and hands back temporary credentials.
+
+That means the role's trust policy trusts the **kiam server's node role**, not an
+OIDC federated principal. See `TRUST-POLICY-kiam.json`.
+
+## Files
+
+| File | Attach to | Notes |
+|---|---|---|
+| `splunk-s3-policy.json` | `SplunkS3Access` | SmartStore read/write + apps read |
+| `splunk-ingestion-separation-policy.json` | `SplunkS3Access` | Only if using `optional/ingestion-separation.yaml` |
+| `TRUST-POLICY-kiam.json` | `SplunkS3Access` (trust relationship) | Names the kiam server node role |
+
+## Setup
+
+```bash
+aws iam create-role --role-name SplunkS3Access \
+  --assume-role-policy-document file://TRUST-POLICY-kiam.json
+
+aws iam put-role-policy --role-name SplunkS3Access \
+  --policy-name splunk-s3 \
+  --policy-document file://splunk-s3-policy.json
+```
+
+The kiam server's node role also needs permission to assume it:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "sts:AssumeRole",
+  "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/SplunkS3Access"
+}
+```
+
+Both halves are required. Missing the trust policy or missing this grant on the
+server node role produces the same symptom: the pod gets no credentials and
+splunkd logs generic S3 access failures.
+
+## Checking it works
+
+kiam failures are quiet on the Splunk side, so verify from kiam:
+
+```bash
+kubectl -n kube-system logs -l app=kiam,component=server | grep -i "assume\|denied"
+```
+
+From inside a Splunk pod, the metadata endpoint should return the role:
+
+```bash
+kubectl -n splunk exec splunk-idxc-indexer-0 -- \
+  curl -s http://169.254.169.254/latest/meta-data/iam/security-credentials/
+```
+
+Empty output means the pod annotation, the namespace regex, or the trust policy
+is wrong — in that order of likelihood.
+
+==== FILE: ./iam/splunk-s3-policy.json ====
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "SmartStoreBucketObjects",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:GetObjectVersion",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts"
+      ],
+      "Resource": "arn:aws:s3:::my-splunk-smartstore/*"
+    },
+    {
+      "Sid": "SmartStoreBucketList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Resource": "arn:aws:s3:::my-splunk-smartstore"
+    },
+    {
+      "Sid": "AppsBucketReadOnly",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectVersion"
+      ],
+      "Resource": "arn:aws:s3:::my-splunk-apps/*"
+    },
+    {
+      "Sid": "AppsBucketList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetBucketLocation"
+      ],
+      "Resource": "arn:aws:s3:::my-splunk-apps"
+    }
+  ]
+}
+
+==== FILE: ./03-licensemanager.yaml ====
+# LicenseManager - owns enterprise.lic and serves it to every other tier.
+# Prereq:
+#   kubectl -n splunk create configmap splunk-licenses --from-file=enterprise.lic
+apiVersion: enterprise.splunk.com/v4
+kind: LicenseManager
+metadata:
+  name: lm
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  # cert-manager secret mounted at /mnt/splunk-tls (operator mounts custom
+  # volumes at /mnt/<name> in every container). tls-combined.pem is the
+  # key+cert file Splunk's serverCert wants; ca.crt is what the verifying
+  # probes and peer checks validate against.
+  volumes:
+    - name: splunk-tls
+      secret:
+        secretName: splunk-manager-tls
+        defaultMode: 0400
+    - name: licenses
+      configMap:
+        name: splunk-licenses
+  extraEnv:
+    - name: SPLUNK_TLS_CA_PATH
+      value: /mnt/splunk-tls/ca.crt
+  image: splunk/splunk:10.2.0
+  # Mounts the ConfigMap at /mnt/licenses
+  licenseUrl: /mnt/licenses/enterprise.lic
+  # Send the LM's own internal logs into the indexer cluster.
+  clusterManagerRef:
+    name: cm
+  monitoringConsoleRef:
+    name: mc
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 10Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 20Gi
+
+==== FILE: ./00-namespace.yaml ====
+# Namespace for the Splunk deployment, annotated for kiam.
+#
+# kiam authorises in two places and BOTH are required:
+#   1. the namespace declares which role names pods in it may assume
+#      (iam.amazonaws.com/permitted, a REGEX matched against the role name)
+#   2. each pod requests a specific role (iam.amazonaws.com/role)
+#
+# A pod asking for a role the namespace regex does not permit is refused by the
+# kiam server, and the AWS SDK inside splunkd sees credential failures, not a
+# clear error - so check the kiam-server logs first when S3 access fails.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: splunk
+  annotations:
+    # Narrow regex - permits only this role, not ".*". Anchor it: kiam matches
+    # the expression against the role name, so an unanchored value is a prefix
+    # match and permits more than you think.
+    iam.amazonaws.com/permitted: "^SplunkS3Access$"
+
+==== FILE: ./04-clustermanager.yaml ====
+# ClusterManager - the control point for the indexer tier.
+# It owns THREE things the indexers never define themselves:
+#   1. SmartStore config (indexes.conf / server.conf) -> pushed as the "splunk-operator" app
+#   2. Cluster-scoped apps (appRepo scope: cluster) -> /opt/splunk/etc/manager-apps -> bundle push
+#   3. Replication/search factors
+apiVersion: enterprise.splunk.com/v4
+kind: ClusterManager
+metadata:
+  annotations:
+    # kiam: propagated to the pod template by the operator via AppendParentMeta,
+    # so the pods assume this role. Must match the namespace's permitted regex.
+    # Changing this value changes the pod template -> rolling restart.
+    iam.amazonaws.com/role: SplunkS3Access
+  name: cm
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  # cert-manager secret mounted at /mnt/splunk-tls (operator mounts custom
+  # volumes at /mnt/<name> in every container). tls-combined.pem is the
+  # key+cert file Splunk's serverCert wants; ca.crt is what the verifying
+  # probes and peer checks validate against.
+  volumes:
+    - name: splunk-tls
+      secret:
+        secretName: splunk-manager-tls
+        defaultMode: 0400
+    - name: splunk-public-tls
+      secret:
+        secretName: splunk-public-tls
+        defaultMode: 0400
+  extraEnv:
+    # Splunk Web over TLS. Probes target 8089, not 8000, so this does not
+    # affect health checking.
+    - name: SPLUNK_HTTP_ENABLESSL
+      value: "true"
+    # Consumed by the verifying probe scripts in tls/probes/.
+    - name: SPLUNK_TLS_CA_PATH
+      value: /mnt/splunk-tls/ca.crt
+  image: splunk/splunk:10.2.0
+  licenseManagerRef:
+    name: lm
+  monitoringConsoleRef:
+    name: mc
+
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 20Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    storageCapacity: 50Gi
+
+  # Replication/search factor for the indexer cluster.
+  defaults: |-
+    splunk:
+      idxc:
+        replication_factor: 2
+        search_factor: 2
+
+  # ---- SmartStore: warm/cold buckets live in S3 ----
+  # Only ClusterManager and Standalone accept a smartstore stanza.
+  smartstore:
+    defaults:
+      volumeName: s3_smartstore
+    cacheManager:
+      # Keep recent data resident so common searches never fault from S3.
+      hotlistRecencySecs: 86400
+      hotlistBloomFilterRecencyHours: 360
+      maxConcurrentDownloads: 8
+      maxConcurrentUploads: 8
+    volumes:
+      - name: s3_smartstore
+        storageType: s3
+        provider: aws
+        path: my-splunk-smartstore/idxc/
+        endpoint: https://s3.us-east-1.amazonaws.com
+        region: us-east-1
+        # No secretRef: credentials come from kiam via the pod annotation
+        # above. Adding secretRef here would override that with static keys.
+    indexes:
+      - name: main
+        remotePath: $_index_name
+      - name: firewall
+        remotePath: $_index_name
+        maxGlobalDataSizeMB: 5000000
+      - name: applogs
+        remotePath: $_index_name
+
+  # ---- Apps/TAs that must land on every indexer peer ----
+  appRepo:
+    appsRepoPollIntervalSeconds: 900
+    defaults:
+      volumeName: s3_apps
+      scope: cluster
+    appSources:
+      # scope: cluster -> staged on CM, bundle-pushed to peers as etc/peer-apps.
+      # Indexer-side TAs (props/transforms/indexes) belong here.
+      - name: indexerTAs
+        location: indexer-apps/
+      # scope: local -> installed on the CM pod only.
+      - name: cmLocalApps
+        location: cm-apps/
+        scope: local
+    volumes:
+      - name: s3_apps
+        storageType: s3
+        provider: aws
+        path: my-splunk-apps/
+        endpoint: https://s3.us-east-1.amazonaws.com
+        region: us-east-1
+
+==== FILE: ./06-searchheadcluster.yaml ====
+# SearchHeadCluster - creates a deployer + N search heads (minimum 3).
+# This is where your existing dashboards/apps go: scope "cluster" stages them on the
+# deployer under etc/shcluster/apps and pushes to every member.
+apiVersion: enterprise.splunk.com/v4
+kind: SearchHeadCluster
+metadata:
+  annotations:
+    # kiam: propagated to the pod template by the operator via AppendParentMeta,
+    # so the pods assume this role. Must match the namespace's permitted regex.
+    # Changing this value changes the pod template -> rolling restart.
+    iam.amazonaws.com/role: SplunkS3Access
+  name: shc
+  namespace: splunk
+  finalizers:
+  - enterprise.splunk.com/delete-pvc
+spec:
+  # cert-manager secret mounted at /mnt/splunk-tls (operator mounts custom
+  # volumes at /mnt/<name> in every container). tls-combined.pem is the
+  # key+cert file Splunk's serverCert wants; ca.crt is what the verifying
+  # probes and peer checks validate against.
+  volumes:
+    - name: splunk-tls
+      secret:
+        secretName: splunk-searchhead-tls
+        defaultMode: 0400
+    - name: splunk-public-tls
+      secret:
+        secretName: splunk-public-tls
+        defaultMode: 0400
+    # Keycloak realm signing cert -> /mnt/saml/keycloak-signing.pem,
+    # matching idpCertPath in saml/splunk_saml_app.
+    - name: saml
+      secret:
+        secretName: splunk-saml-idp
+        defaultMode: 0400
+  extraEnv:
+    # Splunk Web over TLS. Probes target 8089, not 8000, so this does not
+    # affect health checking.
+    - name: SPLUNK_HTTP_ENABLESSL
+      value: "true"
+    # Consumed by the verifying probe scripts in tls/probes/.
+    - name: SPLUNK_TLS_CA_PATH
+      value: /mnt/splunk-tls/ca.crt
+  image: splunk/splunk:10.2.0
+  replicas: 3
+  clusterManagerRef:
+    name: cm
+  licenseManagerRef:
+    name: lm
+  monitoringConsoleRef:
+    name: mc
+
+  etcVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Search heads hold apps + user objects (saved searches, dashboards); keep headroom.
+    storageCapacity: 30Gi
+  varVolumeStorageConfig:
+    storageClassName: splunk-gp3
+    # Search artifacts / dispatch dir, not indexed data.
+    storageCapacity: 100Gi
+
+  resources:
+    requests:
+      cpu: "4"
+      memory: 12Gi
+    limits:
+      cpu: "8"
+      memory: 24Gi
+
+  deployerResourceSpec:
+    requests:
+      cpu: "1"
+      memory: 2Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+  appRepo:
+    appsRepoPollIntervalSeconds: 900
+    defaults:
+      volumeName: s3_apps
+      scope: cluster
+    appSources:
+      # Your existing dashboard apps: cluster scope -> replicated to all search heads.
+      - name: dashboardApps
+        location: search-apps/
+      # Search-time TAs (props/transforms/lookups/eventtypes).
+      - name: searchTAs
+        location: search-tas/
+      # Deployer-only apps. Note: an app needed on BOTH deployer and members must be
+      # listed twice with different names, same location, different scope.
+      - name: deployerLocalApps
+        location: search-apps/
+        scope: local
+      # authentication.conf must be identical on every member, so it goes
+      # through the deployer at cluster scope.
+      - name: samlAuth
+        location: saml-auth/
+    volumes:
+      - name: s3_apps
+        storageType: s3
+        provider: aws
+        path: my-splunk-apps/
+        endpoint: https://s3.us-east-1.amazonaws.com
+        region: us-east-1
+
+  # HARD separation: no two search head members may share a Kubernetes node.
+  #
+  # The operator already injects a podAntiAffinity term for this, but only as
+  # PreferredDuringScheduling (weight 100) - see AppendPodAntiAffinity in
+  # pkg/splunk/common/util.go. Preferred is best-effort: under pressure the
+  # scheduler will happily stack two peers on one node, and a single node
+  # failure then takes out two replicas at once.
+  #
+  # This Required term is what actually enforces it. The operator appends its
+  # Preferred term to whatever is set here rather than replacing it, so both
+  # end up on the pod.
+  #
+  # Consequence: you need at least as many schedulable nodes as replicas, in
+  # the right AZs. A replica with nowhere to go stays Pending rather than
+  # doubling up - which is the intended trade.
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        - labelSelector:
+            matchExpressions:
+              - key: app.kubernetes.io/instance
+                operator: In
+                values:
+                  - splunk-shc-search-head
+          topologyKey: kubernetes.io/hostname
+
+  # AZ spread stays SOFT on purpose. Hard zone spread (DoNotSchedule) would
+  # leave pods Pending whenever a zone is short on capacity, and EBS volumes
+  # are already pinned to a zone - so a replacement must return to its original
+  # AZ regardless. Soft spread balances without blocking recovery.
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: search-head
+          app.kubernetes.io/part-of: splunk-shc-search-head
+
+==== FILE: ./tls/probes/livenessProbe.sh ====
+#!/bin/bash
+# Verifying liveness probe - see readinessProbe.sh for the rationale.
+# Validates the splunkd cert against the internal CA instead of --insecure.
+
+CA_PATH="${SPLUNK_TLS_CA_PATH:-/mnt/splunk-tls/ca.crt}"
+
+[[ -f $SPLUNK_OPERATOR_K8_LIVENESS_DRIVER_FILE_PATH ]] && source $SPLUNK_OPERATOR_K8_LIVENESS_DRIVER_FILE_PATH
+
+get_http_proto_type() {
+    if [[ "false" == "$SPLUNKD_SSL_ENABLE" || \
+          "false" == "$(/opt/splunk/bin/splunk btool server list | grep enableSplunkdSSL | cut -d\  -f 3)" ]]; then
+        echo "http"
+    else
+        echo "https"
+    fi
+}
+
+liveness_probe_check_splunkd_process() {
+    SPLUNK_PROCESS_ID=$(ps ax | grep "splunkd.*start" | grep -v grep | head -1 | awk '{print $1}')
+    state="$(< $CONTAINER_ARTIFACT_DIR/splunk-container.state)"
+    case "$state" in
+    running|started)
+        if [[ -n "$SPLUNK_PROCESS_ID" ]]; then
+            exit 0
+        fi
+        echo "Splunkd not running"
+        exit 1
+    ;;
+    *)
+        exit 1
+    esac
+}
+
+liveness_probe_default() {
+    HTTP_SCHEME=$(get_http_proto_type)
+    state="$(< $CONTAINER_ARTIFACT_DIR/splunk-container.state)"
+
+    case "$state" in
+    running|started)
+        if [[ "$HTTP_SCHEME" == "https" ]]; then
+            if [[ ! -r "$CA_PATH" ]]; then
+                echo "liveness: CA bundle $CA_PATH unreadable; refusing unverified probe"
+                exit 1
+            fi
+            curl --max-time 30 --fail --cacert "$CA_PATH" "https://localhost:8089/"
+        else
+            curl --max-time 30 --fail "http://localhost:8089/"
+        fi
+        if [[ $? == 0 ]]; then
+            exit 0
+        fi
+        echo "Mgmt. port is not reachable or certificate failed verification"
+        exit 1
+    ;;
+    *)
+        exit 1
+    esac
+}
+
+if [[ -n "$NO_HEALTHCHECK" ]]; then
+    exit 0
+fi
+
+case $K8_OPERATOR_LIVENESS_LEVEL in
+1) liveness_probe_check_splunkd_process ;;
+*) liveness_probe_default ;;
+esac
+
+==== FILE: ./tls/probes/startupProbe.sh ====
+#!/bin/bash
+# Verifying startup probe - see readinessProbe.sh for the rationale.
+# Validates the splunkd cert against the internal CA instead of --insecure.
+#
+# Note the ordering problem this one has and the others do not: the startup
+# probe runs before splunkd has necessarily loaded its configuration. If the
+# cert is not yet in place, SCHEME resolves to http and no verification is
+# attempted - correct, because there is nothing yet to authenticate. Once
+# splunkd is up with SSL, every probe verifies.
+
+CA_PATH="${SPLUNK_TLS_CA_PATH:-/mnt/splunk-tls/ca.crt}"
+
+if [[ -n "$NO_HEALTHCHECK" ]]; then
+    exit 0
+fi
+
+if [[ "false" == "$SPLUNKD_SSL_ENABLE" || \
+      "false" == "$(/opt/splunk/bin/splunk btool server list | grep enableSplunkdSSL | cut -d\  -f 3)" ]]; then
+    SCHEME="http"
+else
+    SCHEME="https"
+fi
+
+state="$(< $CONTAINER_ARTIFACT_DIR/splunk-container.state)"
+case "$state" in
+running|started)
+    if [[ "$SCHEME" == "https" ]]; then
+        if [[ ! -r "$CA_PATH" ]]; then
+            echo "startup: CA bundle $CA_PATH unreadable; refusing unverified probe"
+            exit 1
+        fi
+        curl --max-time 30 --fail --cacert "$CA_PATH" "https://localhost:8089/"
+        exit $?
+    fi
+    curl --max-time 30 --fail "http://localhost:8089/"
+    exit $?
+;;
+*)
+    exit 1
+esac
+
+==== FILE: ./tls/probes/readinessProbe.sh ====
+#!/bin/bash
+# Verifying readiness probe.
+#
+# Differs from the shipped tools/k8_probes/readinessProbe.sh in one respect:
+# it does NOT pass curl --insecure. It validates the splunkd certificate
+# against our internal CA and requires the hostname to match, so a probe
+# success is evidence we reached the real splunkd and not something else bound
+# to the port.
+#
+# Requires the pod to mount the tier's cert secret at /mnt/splunk-tls and that
+# cert to carry a localhost SAN (tls/01-certificates.yaml sets both).
+
+CA_PATH="${SPLUNK_TLS_CA_PATH:-/mnt/splunk-tls/ca.crt}"
+
+if [[ -n "$NO_HEALTHCHECK" ]]; then
+    exit 0
+fi
+
+[[ -f $SPLUNK_OPERATOR_K8_LIVENESS_DRIVER_FILE_PATH ]] && source $SPLUNK_OPERATOR_K8_LIVENESS_DRIVER_FILE_PATH
+if [[ "1" == "$K8_OPERATOR_LIVENESS_LEVEL" ]]; then
+    /bin/grep started /opt/container_artifact/splunk-container.state
+    exit $?
+fi
+
+if [[ "false" == "$SPLUNKD_SSL_ENABLE" || \
+      "false" == "$(/opt/splunk/bin/splunk btool server list | grep enableSplunkdSSL | cut -d\  -f 3)" ]]; then
+    SCHEME="http"
+else
+    SCHEME="https"
+fi
+
+state="$(< $CONTAINER_ARTIFACT_DIR/splunk-container.state)"
+case "$state" in
+running|started)
+    if [[ "$SCHEME" == "https" ]]; then
+        # Fail closed: if the CA bundle is absent we do NOT silently fall back
+        # to an unverified request.
+        if [[ ! -r "$CA_PATH" ]]; then
+            echo "readiness: CA bundle $CA_PATH unreadable; refusing unverified probe"
+            exit 1
+        fi
+        curl --max-time 30 --fail --cacert "$CA_PATH" "https://localhost:8089/"
+        exit $?
+    fi
+    curl --max-time 30 --fail "http://localhost:8089/"
+    exit $?
+;;
+*)
+    exit 1
+esac
+
+==== FILE: ./tls/README.md ====
+# TLS
+
+Two goals, and they are not the same thing:
+
+1. **Encryption** — nobody on the network can read the traffic.
+2. **Authentication** — each side proves it is the machine it claims to be.
+
+Encryption without authentication is the `curl --insecure` failure: the channel
+is private, but you have no idea who is on the other end of it. Everything here
+is configured for both.
+
+## What is and is not secure out of the box
+
+| Channel | Port | Default | After this config |
+|---|---|---|---|
+| splunkd mgmt / REST | 8089 | TLS, but with **Splunk's shipped certs** | Our CA, verified both ways |
+| Index replication | 9887 | plaintext | TLS + `requireClientCert` |
+| S2S forwarder data | 9997 | plaintext | TLS + `requireClientCert` |
+| Splunk Web | 8000 | HTTP | HTTPS, public cert |
+| HEC | 8088 | HTTP | HTTPS, token auth |
+
+The 8089 row is the one that surprises people. splunkd *is* TLS by default — but
+with certificates whose private keys ship inside every Splunk distribution on
+earth. Anyone can present one. So `sslVerifyServerCert = true` against the
+default CA authenticates nothing at all; replacing the CA is what makes it mean
+something.
+
+## The two settings that matter
+
+```ini
+sslVerifyServerCert = true   # the peer's cert chains to our CA
+sslVerifyServerName = true   # the peer's CN/SAN matches who we dialled
+```
+
+**Both, always.** `sslVerifyServerCert` on its own checks only the chain, so any
+certificate our CA ever issued is accepted from any peer — an attacker with a
+single valid cert from our CA could impersonate any node. `sslVerifyServerName`
+is what turns "signed by someone we trust" into "is the host we meant".
+
+On the forwarding side the equivalent is `sslCommonNameToCheck` /
+`sslAltNameToCheck` in `outputs.conf`, which pin the acceptable identity.
+
+Mutual TLS — `requireClientCert = true` — is set on every receiving channel, so
+an indexer will not accept replication or events from a peer that cannot prove
+its own identity.
+
+## Certificate layout
+
+`tls-combined.pem` (key + cert in one file) is what Splunk's `serverCert` wants.
+cert-manager emits it via `additionalOutputFormats: [{type: CombinedPEM}]`,
+which needs the `AdditionalCertificateOutputFormats` feature gate on older
+installs. If that file is missing from the secret, the gate is why.
+
+`encoding: PKCS1` is set deliberately — Splunk expects traditional RSA PEM, and
+cert-manager's PKCS8 default fails to load with an unhelpful error.
+
+SANs must cover both the service name and the per-pod headless names, because
+peers connect to pods directly. A missing SAN shows up as a handshake failure
+once `sslVerifyServerName` is on, even though the chain is perfectly valid.
+
+## Health probes
+
+The operator's shipped probes call `curl --insecure` against
+`https://localhost:8089/`. `probes/` replaces all three with versions that pass
+`--cacert` instead and **fail closed** if the CA bundle is unreadable, rather
+than silently falling back to an unverified request.
+
+This is why every internal certificate carries a `localhost` DNS SAN and
+`127.0.0.1` — without them a verifying probe fails on hostname mismatch.
+
+Install them **before the first CR in the namespace**:
+
+```bash
+kubectl -n splunk create configmap splunk-splunk-probe-configmap \
+  --from-file=probes/livenessProbe.sh \
+  --from-file=probes/readinessProbe.sh \
+  --from-file=probes/startupProbe.sh
+```
+
+All three scripts must be present. The operator creates this ConfigMap with its
+defaults if it does not exist, and **never overwrites it** afterwards — so if
+you miss the window, edit it in place rather than expecting a re-create.
+
+## Applying
+
+```bash
+kubectl apply -f 00-issuers.yaml
+kubectl apply -f 01-certificates.yaml
+kubectl -n splunk get certificate    # wait for READY=True on all four
+
+# Package and upload the conf app, then reference it from appRepo
+tar -czf splunk_tls_app.tgz splunk_tls_app/
+aws s3 cp splunk_tls_app.tgz s3://my-splunk-apps/cm-apps/
+aws s3 cp splunk_tls_app.tgz s3://my-splunk-apps/search-apps/
+```
+
+Ship the app to the indexers through the **ClusterManager** `appRepo` with
+`scope: cluster`, and to the search heads through the **SearchHeadCluster**
+`appRepo`, same scope. The conf files reference `/mnt/splunk-tls/...`, which is
+where the CR `volumes:` stanza mounts the cert-manager secret.
+
+## Rollout order
+
+Turning on `requireClientCert` before every peer has a certificate will break
+the cluster — peers that cannot authenticate are simply refused. Stage it:
+
+1. Mount certs and set `serverCert` / `sslRootCAPath` everywhere. Restart.
+2. Confirm every tier is healthy and talking.
+3. Then enable `sslVerifyServerCert`, `sslVerifyServerName`, `requireClientCert`.
+
+Rotation is handled by cert-manager, but Splunk reads certs at startup: a
+renewed secret does **not** take effect until the pods restart.
+
+==== FILE: ./tls/splunk_tls_app/default/web.conf ====
+# Splunk Web TLS (port 8000).
+#
+# Only needed if you serve Splunk Web over TLS passthrough through Traefik. If
+# Traefik terminates and re-encrypts, this still applies - the re-encrypt leg
+# needs Splunk to be listening on HTTPS.
+#
+# Note this points at the PUBLIC cert, not the internal CA one, because a
+# browser must trust it. See traefik/README.md for which model you are using.
+
+[settings]
+enableSplunkWebSSL = true
+privKeyPath = /mnt/splunk-public-tls/tls.key
+serverCert = /mnt/splunk-public-tls/tls.crt
+
+==== FILE: ./tls/splunk_tls_app/default/server.conf ====
+# splunkd management + inter-node TLS (port 8089) and index replication.
+#
+# AUTHENTICITY is the point here, not just encryption:
+#   sslVerifyServerCert = true  -> the peer cert must chain to our CA
+#   sslVerifyServerName = true  -> the peer's CN/SAN must match who we dialled
+#
+# Both are required. sslVerifyServerCert ALONE does not check the hostname, so
+# any cert signed by our CA would be accepted from any peer - which downgrades
+# the CA to a shared secret. sslVerifyServerName is what makes it authentication.
+
+[sslConfig]
+enableSplunkdSSL = true
+serverCert = /mnt/splunk-tls/tls-combined.pem
+sslRootCAPath = /mnt/splunk-tls/ca.crt
+sslVerifyServerCert = true
+sslVerifyServerName = true
+# Do not fall back to Splunk's shipped default certs, whose private keys are
+# published in every Splunk distribution and therefore authenticate nothing.
+sslVersions = tls1.2, tls1.3
+cipherSuite = ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+
+# Index replication between peers (default port 9887).
+[replication_port-ssl://9887]
+serverCert = /mnt/splunk-tls/tls-combined.pem
+sslRootCAPath = /mnt/splunk-tls/ca.crt
+# Mutual TLS: a peer must present a cert from our CA to replicate buckets.
+requireClientCert = true
+
+==== FILE: ./tls/splunk_tls_app/default/inputs.conf ====
+# S2S receiving on the indexers (and ingestors). Mutual TLS.
+#
+# requireClientCert = true means a forwarder must present a certificate signed
+# by our CA. Without it, anyone who can reach port 9997 can inject events - TLS
+# would give you confidentiality with no idea who is sending.
+
+[splunktcp-ssl:9997]
+disabled = 0
+
+[SSL]
+serverCert = /mnt/splunk-tls/tls-combined.pem
+sslRootCAPath = /mnt/splunk-tls/ca.crt
+requireClientCert = true
+sslVersions = tls1.2, tls1.3
+
+==== FILE: ./tls/splunk_tls_app/default/app.conf ====
+[install]
+is_configured = 0
+
+[ui]
+is_visible = 0
+label = Splunk TLS
+
+[launcher]
+author = platform
+description = TLS configuration - certs mounted from cert-manager at /mnt/splunk-tls
+version = 1.0
+
+==== FILE: ./tls/splunk_tls_app/default/outputs.conf ====
+# S2S sending. The forwarding side must verify the indexer it connects to.
+#
+# sslCommonNameToCheck / sslAltNameToCheck pin WHICH identity is acceptable.
+# Without one of them, sslVerifyServerCert only proves the peer holds some cert
+# from our CA - it does not prove it is an indexer.
+
+[tcpout]
+defaultGroup = idxc
+
+[tcpout:idxc]
+server = splunk-idxc-indexer-service:9997
+clientCert = /mnt/splunk-tls/tls-combined.pem
+sslRootCAPath = /mnt/splunk-tls/ca.crt
+sslVerifyServerCert = true
+sslCommonNameToCheck = splunk-idxc-indexer
+sslAltNameToCheck = splunk-idxc-indexer-service, splunk-idxc-indexer-headless
+sslVersions = tls1.2, tls1.3
+useACK = true
+
+==== FILE: ./tls/01-certificates.yaml ====
+# Per-tier certificates.
+#
+# additionalOutputFormats: CombinedPEM is the important part. Splunk's
+# server.conf serverCert wants ONE file containing private key + certificate;
+# cert-manager's default tls.crt/tls.key split does not satisfy it. CombinedPEM
+# adds tls-combined.pem in the same secret, which is exactly that file.
+#
+# This requires the AdditionalCertificateOutputFormats feature gate on both the
+# cert-manager controller and webhook. It is GA in recent cert-manager, but on
+# older installs you must enable it explicitly:
+#   --feature-gates=AdditionalCertificateOutputFormats=true
+# If tls-combined.pem is missing from the secret, that gate is why. Without it
+# you must concatenate key+cert yourself and mount it as your own secret.
+#
+# dnsNames cover the operator's service naming (splunk-<cr>-<type>-service) plus
+# the per-pod names from the headless service, which is what peers actually
+# connect to. Get these wrong and sslVerifyServerCert fails on hostname
+# mismatch even though the chain is valid.
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-indexer-tls
+  namespace: splunk
+spec:
+  secretName: splunk-indexer-tls
+  duration: 2160h     # 90d
+  renewBefore: 360h   # 15d
+  issuerRef:
+    name: splunk-internal
+    kind: Issuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1   # Splunk expects traditional RSA PEM, not PKCS8
+  additionalOutputFormats:
+    - type: CombinedPEM
+  commonName: splunk-idxc-indexer
+  ipAddresses:
+    - 127.0.0.1
+  dnsNames:
+    - localhost
+    - splunk-idxc-indexer-service
+    - splunk-idxc-indexer-service.splunk.svc
+    - splunk-idxc-indexer-service.splunk.svc.cluster.local
+    - splunk-idxc-indexer-headless
+    - splunk-idxc-indexer-headless.splunk.svc
+    - "*.splunk-idxc-indexer-headless.splunk.svc"
+    - "*.splunk-idxc-indexer-headless.splunk.svc.cluster.local"
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-searchhead-tls
+  namespace: splunk
+spec:
+  secretName: splunk-searchhead-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: splunk-internal
+    kind: Issuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1
+  additionalOutputFormats:
+    - type: CombinedPEM
+  commonName: splunk-shc-search-head
+  ipAddresses:
+    - 127.0.0.1
+  dnsNames:
+    - localhost
+    - splunk-shc-search-head-service
+    - splunk-shc-search-head-service.splunk.svc
+    - splunk-shc-search-head-service.splunk.svc.cluster.local
+    - splunk-shc-search-head-headless
+    - "*.splunk-shc-search-head-headless.splunk.svc"
+    - "*.splunk-shc-search-head-headless.splunk.svc.cluster.local"
+    - splunk-shc-deployer-service
+    - splunk-shc-deployer-service.splunk.svc
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-manager-tls
+  namespace: splunk
+spec:
+  secretName: splunk-manager-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: splunk-internal
+    kind: Issuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1
+  additionalOutputFormats:
+    - type: CombinedPEM
+  commonName: splunk-managers
+  ipAddresses:
+    - 127.0.0.1
+  dnsNames:
+    - localhost
+    - splunk-cm-cluster-manager-service
+    - splunk-cm-cluster-manager-service.splunk.svc
+    - splunk-cm-cluster-manager-service.splunk.svc.cluster.local
+    - splunk-lm-license-manager-service
+    - splunk-lm-license-manager-service.splunk.svc
+    - splunk-mc-monitoring-console-service
+    - splunk-mc-monitoring-console-service.splunk.svc
+---
+# Browser-trusted cert for the hostnames Traefik serves. Consumed by Traefik,
+# NOT mounted into Splunk - unless you use TLS passthrough for Splunk Web, in
+# which case Splunk itself must present this cert. See traefik/README.md.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-public-tls
+  namespace: splunk
+spec:
+  secretName: splunk-public-tls
+  duration: 2160h
+  renewBefore: 360h
+  issuerRef:
+    name: letsencrypt
+    kind: Issuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1
+  additionalOutputFormats:
+    - type: CombinedPEM
+  dnsNames:
+    - splunk.example.com
+    - mc.splunk.example.com
+    - cm.splunk.example.com
+
+==== FILE: ./tls/00-issuers.yaml ====
+# cert-manager issuers.
+#
+# TWO separate trust domains, deliberately:
+#
+#   internal  - a private CA whose certs secure Splunk-to-Splunk traffic
+#               (splunkd 8089, S2S 9997, index replication 9887). Nothing
+#               outside the cluster validates these, so a private CA is right
+#               and avoids burning public cert quota on pod churn.
+#
+#   public    - a real, browser-trusted cert for the UI hostnames that users
+#               and forwarders outside the cluster hit through Traefik.
+---
+# Bootstrap: a self-signed issuer used only to mint the internal CA below.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: selfsigned-bootstrap
+  namespace: splunk
+spec:
+  selfSigned: {}
+---
+# The internal CA certificate itself. Long-lived; rotating it means restarting
+# every Splunk pod, so treat it as infrastructure.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-internal-ca
+  namespace: splunk
+spec:
+  isCA: true
+  commonName: splunk-internal-ca
+  secretName: splunk-internal-ca
+  duration: 43800h    # 5 years
+  renewBefore: 8760h  # 1 year
+  privateKey:
+    algorithm: RSA
+    size: 4096
+  issuerRef:
+    name: selfsigned-bootstrap
+    kind: Issuer
+---
+# Issues the per-tier certs from the CA above.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: splunk-internal
+  namespace: splunk
+spec:
+  ca:
+    secretName: splunk-internal-ca
+---
+# Public issuer for UI hostnames. DNS-01 shown because Splunk Web sits behind
+# TLS passthrough, so HTTP-01 cannot be solved through Traefik for that host.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: letsencrypt
+  namespace: splunk
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: platform@example.com
+    privateKeySecretRef:
+      name: letsencrypt-account-key
+    solvers:
+      - dns01:
+          route53:
+            region: us-east-1
+            # With kiam, annotate the cert-manager pod for a role allowing
+            # route53:ChangeResourceRecordSets on the hosted zone, exactly as
+            # the Splunk pods are annotated. IRSA fields would not apply here.
+            hostedZoneID: <HOSTED_ZONE_ID>
+
+==== FILE: ./00b-operator-namespace-kiam.yaml ====
+# The OPERATOR also talks to S3 - the App Framework downloads app packages in
+# the operator pod before copying them into the Splunk pods. So the operator's
+# own namespace and pod need kiam wiring too, or app installs fail while the
+# Splunk tiers look perfectly healthy.
+#
+# The operator is installed from splunk-operator-cluster.yaml, so patch rather
+# than re-declare. Both commands are idempotent.
+#
+#   kubectl annotate namespace splunk-operator \
+#     iam.amazonaws.com/permitted="^SplunkS3Access$" --overwrite
+#
+#   kubectl -n splunk-operator patch deploy splunk-operator-controller-manager \
+#     --type=merge -p \
+#     '{"spec":{"template":{"metadata":{"annotations":{"iam.amazonaws.com/role":"SplunkS3Access"}}}}}'
+#
+# Verify the annotation landed on the POD, not just the Deployment:
+#   kubectl -n splunk-operator get pod -l control-plane=controller-manager \
+#     -o jsonpath='{.items[0].metadata.annotations}'
+#
+# If you prefer a separate, read-only role for the operator (it only needs GET
+# on the apps bucket, never the SmartStore bucket), create it from the
+# AppsBucket* statements in iam/splunk-s3-policy.json and widen the namespace
+# regex to cover both role names.
+
