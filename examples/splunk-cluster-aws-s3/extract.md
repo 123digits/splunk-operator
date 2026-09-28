@@ -10,7 +10,7 @@ recreates subdirectories as it goes.
 ## Regenerate
 
 ```sh
-cd splunk-cluster-aws-s3
+cd examples/splunk-cluster-aws-s3
 find . -type f -exec sh -c 'printf "==== FILE: %s ====\n" "$1"; cat "$1"; printf "\n"' _ {} \; > ../combined.txt
 ```
 
@@ -20,8 +20,9 @@ pick it up and concatenate it into itself.
 
 ## Notes
 
-`combined.txt` holds the whole of `splunk-cluster-aws-s3/` — 41 files, each
-introduced by `==== FILE: <path> ====`.
+`combined.txt` holds the whole of `splunk-cluster-aws-s3/`, including this file,
+each entry introduced by `==== FILE: <path> ====`. Extracting therefore gives you
+these instructions back alongside everything else.
 
 Nothing may precede the first marker. The extractor prints every non-marker line
 to the current filename, so a header or preamble is written to an empty filename
