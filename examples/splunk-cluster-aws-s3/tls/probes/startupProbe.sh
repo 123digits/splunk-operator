@@ -1,6 +1,7 @@
 #!/bin/bash
 # Verifying startup probe - see readinessProbe.sh for the rationale.
-# Validates the splunkd cert against the internal CA instead of --insecure.
+# Validates the splunkd cert against the org CA bundle instead of --insecure,
+# by the pod's own .svc.cluster.local FQDN pinned to 127.0.0.1.
 #
 # Note the ordering problem this one has and the others do not: the startup
 # probe runs before splunkd has necessarily loaded its configuration. If the
@@ -8,7 +9,19 @@
 # attempted - correct, because there is nothing yet to authenticate. Once
 # splunkd is up with SSL, every probe verifies.
 
-CA_PATH="${SPLUNK_TLS_CA_PATH:-/mnt/splunk-tls/ca.crt}"
+CA_PATH="${SPLUNK_TLS_CA_PATH:-/mnt/splunk-ca/ca.crt}"
+
+probe_host() {
+    if [[ -n "$SPLUNK_TLS_PROBE_HOST" ]]; then
+        echo "$SPLUNK_TLS_PROBE_HOST"
+        return
+    fi
+    # /etc/hosts, not getent - see readinessProbe.sh.
+    awk -v h="$HOSTNAME" '!/^[[:space:]]*#/ {
+        for (i = 2; i <= NF; i++)
+            if (index($i, h ".") == 1 && $i ~ /\.svc\./) { print $i; exit }
+    }' /etc/hosts
+}
 
 if [[ -n "$NO_HEALTHCHECK" ]]; then
     exit 0
@@ -29,7 +42,13 @@ running|started)
             echo "startup: CA bundle $CA_PATH unreadable; refusing unverified probe"
             exit 1
         fi
-        curl --max-time 30 --fail --cacert "$CA_PATH" "https://localhost:8089/"
+        HOST="$(probe_host)"
+        if [[ -z "$HOST" ]]; then
+            echo "startup: no .svc FQDN for $HOSTNAME; refusing unverified probe"
+            exit 1
+        fi
+        curl --max-time 30 --fail --cacert "$CA_PATH" \
+            --resolve "$HOST:8089:127.0.0.1" "https://$HOST:8089/"
         exit $?
     fi
     curl --max-time 30 --fail "http://localhost:8089/"

@@ -51,10 +51,39 @@ metadata:
   finalizers:
   - enterprise.splunk.com/delete-pvc
 spec:
-  image: splunk/splunk:10.2.0
+  # TLS - REQUIRED once tls/probes/ is installed (namespace-wide probes fail
+  # closed without a cert and CA). See 03-licensemanager.yaml. This covers
+  # splunkd and Splunk Web; S2S/HEC receiving on ingestors is not hardened here.
+  volumes:
+    - name: splunk-tls
+      secret:
+        secretName: splunk-ingestor-tls
+        defaultMode: 0400
+    - name: splunk-ca
+      secret:
+        secretName: all-trusted-partners
+        defaultMode: 0444
+    - name: tls-defaults
+      configMap:
+        name: splunk-tls-defaults
+    - name: ansible-library
+      configMap:
+        name: splunk-ansible-library
+  defaultsUrl: /mnt/tls-defaults/ingestor.yml
+  extraEnv:
+    - name: SPLUNK_TLS_CA_PATH
+      value: /mnt/splunk-ca/ca.crt
+    # Verifying splunk_api override - see 03-licensemanager.yaml.
+    - name: ANSIBLE_LIBRARY
+      value: /mnt/ansible-library:/opt/ansible/library:/opt/ansible/apps/library:/opt/ansible/ansible_commands
+  image: splunk/splunk:10.4.4
+  # Must not exceed the pod names in splunk-ingestor-tls below.
   replicas: 3
   licenseManagerRef:
     name: lm
+    # namespace makes the operator pass the FQDN (…svc.cluster.local), not
+    # the short service name: TLS host name validation checks the name dialled.
+    namespace: splunk
   monitoringConsoleRef:
     name: mc
   queueRef:
@@ -68,3 +97,41 @@ spec:
     storageClassName: splunk-gp3
     # Ingestors do not retain data; they forward to SQS.
     storageCapacity: 50Gi
+---
+# Tier cert for the ingestors - same rules as tls/01-certificates.yaml.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-ingestor-tls
+  namespace: splunk
+spec:
+  secretName: splunk-ingestor-tls
+  renewBefore: 360h
+  issuerRef:
+    name: org-acme
+    kind: ClusterIssuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1
+  usages:
+    - server auth
+    - client auth
+    - digital signature
+    - key encipherment
+  additionalOutputFormats:
+    - type: CombinedPEM
+  # KV store requires an O, OU or DC in the subject once TLS verification is
+  # on. Some ACME services strip subject fields - check the issued cert.
+  subject:
+    organizations:
+      - Example Org   # REPLACE with your org name
+  commonName: splunk-ingestor-ingestor-service.splunk.svc.cluster.local
+  dnsNames:
+    # Lets splunk-ansible verify its loopback REST calls (tls/ansible-library).
+    - localhost
+    - splunk-ingestor-ingestor-service.splunk.svc.cluster.local
+    - splunk-ingestor-ingestor-headless.splunk.svc.cluster.local
+    - splunk-ingestor-ingestor-0.splunk-ingestor-ingestor-headless.splunk.svc.cluster.local
+    - splunk-ingestor-ingestor-1.splunk-ingestor-ingestor-headless.splunk.svc.cluster.local
+    - splunk-ingestor-ingestor-2.splunk-ingestor-ingestor-headless.splunk.svc.cluster.local

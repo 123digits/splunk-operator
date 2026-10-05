@@ -9,27 +9,51 @@ metadata:
   finalizers:
   - enterprise.splunk.com/delete-pvc
 spec:
-  # cert-manager secret mounted at /mnt/splunk-tls (operator mounts custom
-  # volumes at /mnt/<name> in every container). tls-combined.pem is the
-  # key+cert file Splunk's serverCert wants; ca.crt is what the verifying
-  # probes and peer checks validate against.
+  # TLS - see tls/README.md. The operator mounts each custom volume at
+  # /mnt/<name> in every container:
+  #   /mnt/splunk-tls      tier cert from cert-manager (tls-combined.pem = key+chain)
+  #   /mnt/splunk-ca       org CA bundle (existing Secret all-trusted-partners)
+  #   /mnt/tls-defaults    splunk-ansible TLS settings, loaded via defaultsUrl
+  #   /mnt/ansible-library verifying splunk_api module for splunk-ansible
   volumes:
     - name: splunk-tls
       secret:
         secretName: splunk-manager-tls
         defaultMode: 0400
+    - name: splunk-ca
+      secret:
+        secretName: all-trusted-partners
+        defaultMode: 0444
+    - name: tls-defaults
+      configMap:
+        name: splunk-tls-defaults
+    - name: ansible-library
+      configMap:
+        name: splunk-ansible-library
     - name: licenses
       configMap:
         name: splunk-licenses
+  defaultsUrl: /mnt/tls-defaults/common.yml
   extraEnv:
+    # Consumed by the verifying probe scripts in tls/probes/.
     - name: SPLUNK_TLS_CA_PATH
-      value: /mnt/splunk-tls/ca.crt
-  image: splunk/splunk:10.2.0
+      value: /mnt/splunk-ca/ca.crt
+    # Puts tls/ansible-library first on ansible's module path, replacing the
+    # stock splunk_api module with one that calls https://localhost:8089 and
+    # verifies against /mnt/splunk-ca/ca.crt. Read by ansible-playbook itself,
+    # which (unlike its modules) runs with the pod environment. See
+    # tls/README.md, "Ansible".
+    - name: ANSIBLE_LIBRARY
+      value: /mnt/ansible-library:/opt/ansible/library:/opt/ansible/apps/library:/opt/ansible/ansible_commands
+  image: splunk/splunk:10.4.4
   # Mounts the ConfigMap at /mnt/licenses
   licenseUrl: /mnt/licenses/enterprise.lic
   # Send the LM's own internal logs into the indexer cluster.
   clusterManagerRef:
     name: cm
+    # namespace makes the operator pass the FQDN (…svc.cluster.local), not
+    # the short service name: TLS host name validation checks the name dialled.
+    namespace: splunk
   monitoringConsoleRef:
     name: mc
   etcVolumeStorageConfig:

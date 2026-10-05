@@ -175,16 +175,23 @@ identified subject and a Continue button. Truly automatic login needs a theme
 override that auto-submits, or a custom authenticator. Budget for it rather
 than assuming.
 
-### Three CAs, kept separate
+### One PKI, two directions
 
-| Purpose | CA |
+| Purpose | Issued by |
 |---|---|
-| Pod-to-pod Splunk traffic | cert-manager internal CA (`../tls/`) |
-| Browser-facing server certs | Public / Let's Encrypt (`../tls/`) |
-| **User client certs** | Your corporate/smartcard PKI |
+| Pod-to-pod Splunk traffic | Org ACME (`../tls/`) |
+| Browser-facing server certs | Org ACME (`../tls/`) |
+| **User client certs** | Org PKI |
 
-If the internal CA could also sign user certs, any pod's service certificate
-would authenticate as a person.
+The same org PKI signs servers and users, and `all-trusted-partners` trusts all
+of it, so trust must be narrowed by identity, not by CA, in both directions:
+
+- **A user cert must not pass as a Splunk peer.** `../tls/02-tls-defaults.yaml`
+  pins peers with `sslAltNameToCheck` to the tier service names.
+- **A service cert must not pass as a user.** Give Traefik's `user-pki-ca` only
+  the user-issuing CAs if they are distinct. Either way, Keycloak's X.509
+  authenticator must map certs to *existing* users only, so a pod's
+  certificate finds no account.
 
 ---
 
@@ -289,10 +296,12 @@ you lock yourself out.
   `admin` using the password in `splunk-<ns>-secret` for bundle pushes and
   cluster operations. SSO is for humans; do not disable native auth.
 - **Port 8089 stays on the network.** Cluster traffic, replication and the
-  operator's REST calls all cross pods on 8089; it is protected by mutual TLS in
-  `../tls/`.
+  operator's REST calls all cross pods on 8089. It is TLS with org certs and
+  pinned peer verification (`../tls/`), but not client-cert-required: the
+  operator and splunk-ansible present no client certificate. Admin credentials
+  and `pass4SymmKey` are what gate it.
 - **These are Splunk product settings, not operator features.** The operator has
   no authentication support in 3.1.0 — it just ships the app. Unlike the CR
   manifests, nothing here is schema-validated by this repo, so check key names
   against the `.spec` files for your Splunk version. This deployment pins
-  `splunk/splunk:10.2.0` while the reference consulted was 10.4.
+  `splunk/splunk:10.4.4`, matching the 10.4 reference consulted.

@@ -4,8 +4,11 @@
 # HTTPS to the backend but does NOT verify it - the connection is encrypted and
 # unauthenticated, which is the same failure as curl --insecure, just moved.
 #
-# rootCAsSecrets makes Traefik validate the backend cert against our internal
-# CA; serverName makes it check the identity rather than just the chain.
+# rootCAsSecrets makes Traefik validate the backend cert against the org CA
+# bundle (the existing all-trusted-partners Secret); serverName makes it check
+# the identity rather than just the chain. serverName must be a
+# .svc.cluster.local name - the only form the tier certs carry. Splunk Web and
+# HEC present the tier cert (tls/02-tls-defaults.yaml), so these names match.
 ---
 apiVersion: traefik.io/v1alpha1
 kind: ServersTransport
@@ -13,9 +16,9 @@ metadata:
   name: splunk-searchhead
   namespace: splunk
 spec:
-  serverName: splunk-shc-search-head-service.splunk.svc
+  serverName: splunk-shc-search-head-service.splunk.svc.cluster.local
   rootCAsSecrets:
-    - splunk-internal-ca
+    - all-trusted-partners
   # NEVER set insecureSkipVerify: true here. It is the whole point of this file.
   insecureSkipVerify: false
 ---
@@ -25,7 +28,7 @@ metadata:
   name: splunk-managers
   namespace: splunk
 spec:
-  serverName: splunk-mc-monitoring-console-service.splunk.svc
+  serverName: splunk-mc-monitoring-console-service.splunk.svc.cluster.local
   rootCAsSecrets:
-    - splunk-internal-ca
+    - all-trusted-partners
   insecureSkipVerify: false

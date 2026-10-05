@@ -1,10 +1,23 @@
 #!/bin/bash
 # Verifying liveness probe - see readinessProbe.sh for the rationale.
-# Validates the splunkd cert against the internal CA instead of --insecure.
+# Validates the splunkd cert against the org CA bundle instead of --insecure,
+# by the pod's own .svc.cluster.local FQDN pinned to 127.0.0.1.
 
-CA_PATH="${SPLUNK_TLS_CA_PATH:-/mnt/splunk-tls/ca.crt}"
+CA_PATH="${SPLUNK_TLS_CA_PATH:-/mnt/splunk-ca/ca.crt}"
 
 [[ -f $SPLUNK_OPERATOR_K8_LIVENESS_DRIVER_FILE_PATH ]] && source $SPLUNK_OPERATOR_K8_LIVENESS_DRIVER_FILE_PATH
+
+probe_host() {
+    if [[ -n "$SPLUNK_TLS_PROBE_HOST" ]]; then
+        echo "$SPLUNK_TLS_PROBE_HOST"
+        return
+    fi
+    # /etc/hosts, not getent - see readinessProbe.sh.
+    awk -v h="$HOSTNAME" '!/^[[:space:]]*#/ {
+        for (i = 2; i <= NF; i++)
+            if (index($i, h ".") == 1 && $i ~ /\.svc\./) { print $i; exit }
+    }' /etc/hosts
+}
 
 get_http_proto_type() {
     if [[ "false" == "$SPLUNKD_SSL_ENABLE" || \
@@ -42,7 +55,13 @@ liveness_probe_default() {
                 echo "liveness: CA bundle $CA_PATH unreadable; refusing unverified probe"
                 exit 1
             fi
-            curl --max-time 30 --fail --cacert "$CA_PATH" "https://localhost:8089/"
+            HOST="$(probe_host)"
+            if [[ -z "$HOST" ]]; then
+                echo "liveness: no .svc FQDN for $HOSTNAME; refusing unverified probe"
+                exit 1
+            fi
+            curl --max-time 30 --fail --cacert "$CA_PATH" \
+                --resolve "$HOST:8089:127.0.0.1" "https://$HOST:8089/"
         else
             curl --max-time 30 --fail "http://localhost:8089/"
         fi

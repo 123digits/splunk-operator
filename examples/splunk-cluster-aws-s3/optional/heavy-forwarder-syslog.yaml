@@ -18,12 +18,44 @@ metadata:
   finalizers:
   - enterprise.splunk.com/delete-pvc
 spec:
-  image: splunk/splunk:10.2.0
+  # TLS - REQUIRED, not optional, once tls/probes/ is installed: the probe
+  # ConfigMap is shared by every CR in the namespace, and the verifying probes
+  # fail closed without a cert and CA. See 03-licensemanager.yaml.
+  volumes:
+    - name: splunk-tls
+      secret:
+        secretName: splunk-hwf-tls
+        defaultMode: 0400
+    - name: splunk-ca
+      secret:
+        secretName: all-trusted-partners
+        defaultMode: 0444
+    - name: tls-defaults
+      configMap:
+        name: splunk-tls-defaults
+    - name: ansible-library
+      configMap:
+        name: splunk-ansible-library
+  defaultsUrl: /mnt/tls-defaults/common.yml
+  extraEnv:
+    - name: SPLUNK_TLS_CA_PATH
+      value: /mnt/splunk-ca/ca.crt
+    # Verifying splunk_api override - see 03-licensemanager.yaml.
+    - name: ANSIBLE_LIBRARY
+      value: /mnt/ansible-library:/opt/ansible/library:/opt/ansible/apps/library:/opt/ansible/ansible_commands
+  image: splunk/splunk:10.4.4
+  # Must not exceed the pod names in splunk-hwf-tls below.
   replicas: 2
   licenseManagerRef:
     name: lm
+    # namespace makes the operator pass the FQDN (…svc.cluster.local), not
+    # the short service name: TLS host name validation checks the name dialled.
+    namespace: splunk
   clusterManagerRef:
     name: cm
+    # namespace makes the operator pass the FQDN (…svc.cluster.local), not
+    # the short service name: TLS host name validation checks the name dialled.
+    namespace: splunk
   monitoringConsoleRef:
     name: mc
   etcVolumeStorageConfig:
@@ -48,6 +80,45 @@ spec:
           port: 5514
           targetPort: 5514
           protocol: TCP
+---
+# Tier cert for the heavy forwarders - same rules as tls/01-certificates.yaml.
+# The service name is pinned in tls/02-tls-defaults.yaml, including the
+# indexers' S2S allow-list, so these forwarders may send.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: splunk-hwf-tls
+  namespace: splunk
+spec:
+  secretName: splunk-hwf-tls
+  renewBefore: 360h
+  issuerRef:
+    name: org-acme
+    kind: ClusterIssuer
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    encoding: PKCS1
+  usages:
+    - server auth
+    - client auth
+    - digital signature
+    - key encipherment
+  additionalOutputFormats:
+    - type: CombinedPEM
+  # KV store requires an O, OU or DC in the subject once TLS verification is
+  # on. Some ACME services strip subject fields - check the issued cert.
+  subject:
+    organizations:
+      - Example Org   # REPLACE with your org name
+  commonName: splunk-hwf-standalone-service.splunk.svc.cluster.local
+  dnsNames:
+    # Lets splunk-ansible verify its loopback REST calls (tls/ansible-library).
+    - localhost
+    - splunk-hwf-standalone-service.splunk.svc.cluster.local
+    - splunk-hwf-standalone-headless.splunk.svc.cluster.local
+    - splunk-hwf-standalone-0.splunk-hwf-standalone-headless.splunk.svc.cluster.local
+    - splunk-hwf-standalone-1.splunk-hwf-standalone-headless.splunk.svc.cluster.local
 ---
 # Dedicated LB for the syslog listener. Keep externalTrafficPolicy: Local so the
 # original client IP survives - syslog sourcetyping usually depends on it.

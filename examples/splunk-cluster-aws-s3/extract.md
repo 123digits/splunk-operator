@@ -11,8 +11,11 @@ recreates subdirectories as it goes.
 
 ```sh
 cd examples/splunk-cluster-aws-s3
-find . -type f -exec sh -c 'printf "==== FILE: %s ====\n" "$1"; cat "$1"; printf "\n"' _ {} \; > ../combined.txt
+find . -type f -not -path './tls/lab/.generated/*' -exec sh -c 'printf "==== FILE: %s ====\n" "$1"; cat "$1"; printf "\n"' _ {} \; > ../combined.txt
 ```
+
+`tls/lab/.generated/` is excluded: it holds the lab's generated test keys and is
+git-ignored.
 
 The output **must** land outside the directory being walked. Redirection creates
 the file before `find` runs, so `> combined.txt` inside the tree makes `find`

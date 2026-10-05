@@ -32,6 +32,10 @@ Two version-specific cautions:
   separation stack in file 07** (`IngestorCluster`/`Queue`/`ObjectStorage` require
   10.2+). The CRDs are present at 3.1.0 either way, so this fails at runtime, not at
   apply time. Override the image or pin it per CR.
+- **This example pins `splunk/splunk:10.4.4`.** `tls/` needs 10.4: TLS 1.3 (and
+  its cipher control) arrives in 10.4.0, and its splunk-ansible is the first to
+  handle `replication_port-ssl` correctly. Do not drop below 10.4.0 without
+  reworking `tls/02-tls-defaults.yaml`.
 - **`RELATED_IMAGE_SPLUNK_ENTERPRISE` in the published release YAML is injected at
   build time** from a CI secret, and the Makefile's own default is the untagged
   `docker.io/splunk/splunk`. Do not rely on it. Every CR in this directory sets
@@ -810,8 +814,9 @@ site-aware bucket placement.
 
 Two directories cover this, each with its own README:
 
-- **`tls/`** — cert-manager issuers and per-tier certificates, a Splunk conf app
-  that turns on peer verification, and replacement health-probe scripts.
+- **`tls/`** — per-tier certificates from the org ACME issuer, splunk-ansible
+  defaults that turn on peer verification, and replacement health-probe
+  scripts. Trust comes from the existing `all-trusted-partners` Secret.
 - **`traefik/`** — IngressRoute / IngressRouteTCP for the UIs, forwarder ingest
   and HEC.
 
@@ -827,14 +832,23 @@ distribution. Verification against that CA proves nothing. Replacing it is the
 point of `tls/`.
 
 **`sslVerifyServerCert` alone is not authentication.** It checks that the peer's
-cert chains to your CA, not that the peer is who you dialled. Pair it with
-`sslVerifyServerName` (or `sslCommonNameToCheck` on the forwarding side) or any
-cert your CA ever issued will be accepted from any host.
+cert chains to your CA, and the org PKI also issues user certs. Peers dial each
+other by pod IP, which no SAN may carry, so `sslVerifyServerName` cannot work
+either. Every client instead pins the tier identities with `sslAltNameToCheck`.
+
+**splunk-ansible's own REST calls are replaced, not trusted.** The stock module
+calls `https://127.0.0.1:8089`. When a CA bundle reaches it (via a login profile
+or `ansible_environment` — not pod env, which `sudo -i` drops), it fails
+`check_for_required_restarts` with `CERTIFICATE_VERIFY_FAILED`.
+`tls/ansible-library/` overrides it, through `ANSIBLE_LIBRARY` on every CR,
+with a copy that calls `https://localhost:8089` and verifies against the org
+bundle. See `tls/README.md` § Ansible.
 
 The operator's own probe scripts use `curl --insecure`. `tls/probes/` replaces
-all three with versions that validate against the internal CA and fail closed.
-Install the ConfigMap **before the first CR in the namespace** — the operator
-creates it with defaults if absent and never overwrites it afterwards.
+all three with versions that verify against the org bundle via the pod's
+`.svc.cluster.local` FQDN, and fail closed. Install the ConfigMap **before the
+first CR in the namespace** — the operator creates it with defaults if absent
+and never overwrites it afterwards.
 
 ## 12. User login
 

@@ -1,21 +1,40 @@
-# Per-tier certificates.
+# Per-tier certificates from the org ACME issuer.
 #
-# additionalOutputFormats: CombinedPEM is the important part. Splunk's
-# server.conf serverCert wants ONE file containing private key + certificate;
-# cert-manager's default tls.crt/tls.key split does not satisfy it. CombinedPEM
-# adds tls-combined.pem in the same secret, which is exactly that file.
+# SAN POLICY: names ending in .svc.cluster.local, plus localhost. No IP
+# addresses, no short service names, no .svc. Everything else in tls/ is built
+# so that nothing ever needs one of those:
+#   - splunk-ansible's REST calls are redirected from 127.0.0.1 to localhost
+#     by tls/ansible-library/splunk_api.py, and verify against the localhost
+#     SAN (see tls/README.md, "Ansible").
+#   - the probes connect to the pod FQDN, pinned to 127.0.0.1 with
+#     curl --resolve - a stronger check than localhost, which any org server
+#     cert may carry.
+#   - splunkd peer checks pin identities with sslAltNameToCheck instead of
+#     matching the dialled hostname, which is often a pod IP.
 #
-# This requires the AdditionalCertificateOutputFormats feature gate on both the
-# cert-manager controller and webhook. It is GA in recent cert-manager, but on
-# older installs you must enable it explicitly:
-#   --feature-gates=AdditionalCertificateOutputFormats=true
-# If tls-combined.pem is missing from the secret, that gate is why. Without it
-# you must concatenate key+cert yourself and mount it as your own secret.
+# Each pod's own FQDN must be present: <pod>.<headless-svc>.splunk.svc.cluster.local.
+# They are listed explicitly because ACME services commonly refuse wildcards
+# for names they cannot DNS-01 validate. Scaling a tier past the names listed
+# here means adding names and letting cert-manager reissue BEFORE scaling;
+# a pod missing from its cert fails its own readiness probe.
 #
-# dnsNames cover the operator's service naming (splunk-<cr>-<type>-service) plus
-# the per-pod names from the headless service, which is what peers actually
-# connect to. Get these wrong and sslVerifyServerCert fails on hostname
-# mismatch even though the chain is valid.
+# If your ACME service does issue wildcards, each explicit pod list can be
+# replaced with one "*.<headless-svc>.splunk.svc.cluster.local" entry.
+#
+# commonName is set to a name that is also in dnsNames: many ACME services
+# reject a CN that is not one of the SANs. Org policy caps CN at 63 characters
+# (SANs at 255), which is why the CN is the tier SERVICE name (52-58 chars
+# here) and never a pod FQDN (~87). A longer CR name can push the service name
+# past 63; then drop commonName and rely on dnsNames alone.
+#
+# additionalOutputFormats: CombinedPEM adds tls-combined.pem (key + chain in
+# one file), which is what splunkd's serverCert / clientCert want. It needs the
+# AdditionalCertificateOutputFormats feature gate on older cert-manager.
+#
+# encoding: PKCS1 - Splunk expects traditional RSA PEM. The key is generated
+# by cert-manager, not the ACME server, so this holds for ACME issuers too.
+#
+# No duration: ACME servers set validity themselves and ignore the request.
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -24,29 +43,39 @@ metadata:
   namespace: splunk
 spec:
   secretName: splunk-indexer-tls
-  duration: 2160h     # 90d
   renewBefore: 360h   # 15d
   issuerRef:
-    name: splunk-internal
-    kind: Issuer
+    name: org-acme
+    kind: ClusterIssuer
   privateKey:
     algorithm: RSA
     size: 2048
-    encoding: PKCS1   # Splunk expects traditional RSA PEM, not PKCS8
+    encoding: PKCS1
+  # Mutual TLS presents these as CLIENT certs too (S2S, forwarding). If the
+  # ACME service issues serverAuth-only certs, peers reject them as clients.
+  usages:
+    - server auth
+    - client auth
+    - digital signature
+    - key encipherment
   additionalOutputFormats:
     - type: CombinedPEM
-  commonName: splunk-idxc-indexer
-  ipAddresses:
-    - 127.0.0.1
+  # KV store requires an O, OU or DC in the subject once TLS verification is
+  # on. Some ACME services strip subject fields - check the issued cert.
+  subject:
+    organizations:
+      - Example Org   # REPLACE with your org name
+  commonName: splunk-idxc-indexer-service.splunk.svc.cluster.local
   dnsNames:
+    # Lets splunk-ansible verify its loopback REST calls (tls/ansible-library).
     - localhost
-    - splunk-idxc-indexer-service
-    - splunk-idxc-indexer-service.splunk.svc
+    # Pinned identity for this tier - see sslAltNameToCheck in 02-tls-defaults.
     - splunk-idxc-indexer-service.splunk.svc.cluster.local
-    - splunk-idxc-indexer-headless
-    - splunk-idxc-indexer-headless.splunk.svc
-    - "*.splunk-idxc-indexer-headless.splunk.svc"
-    - "*.splunk-idxc-indexer-headless.splunk.svc.cluster.local"
+    - splunk-idxc-indexer-headless.splunk.svc.cluster.local
+    # One per replica (05-indexercluster.yaml replicas: 3).
+    - splunk-idxc-indexer-0.splunk-idxc-indexer-headless.splunk.svc.cluster.local
+    - splunk-idxc-indexer-1.splunk-idxc-indexer-headless.splunk.svc.cluster.local
+    - splunk-idxc-indexer-2.splunk-idxc-indexer-headless.splunk.svc.cluster.local
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -55,30 +84,42 @@ metadata:
   namespace: splunk
 spec:
   secretName: splunk-searchhead-tls
-  duration: 2160h
   renewBefore: 360h
   issuerRef:
-    name: splunk-internal
-    kind: Issuer
+    name: org-acme
+    kind: ClusterIssuer
   privateKey:
     algorithm: RSA
     size: 2048
     encoding: PKCS1
+  # Mutual TLS presents these as CLIENT certs too (S2S, forwarding). If the
+  # ACME service issues serverAuth-only certs, peers reject them as clients.
+  usages:
+    - server auth
+    - client auth
+    - digital signature
+    - key encipherment
   additionalOutputFormats:
     - type: CombinedPEM
-  commonName: splunk-shc-search-head
-  ipAddresses:
-    - 127.0.0.1
+  # KV store requires an O, OU or DC in the subject once TLS verification is
+  # on. Some ACME services strip subject fields - check the issued cert.
+  subject:
+    organizations:
+      - Example Org   # REPLACE with your org name
+  commonName: splunk-shc-search-head-service.splunk.svc.cluster.local
   dnsNames:
+    # Lets splunk-ansible verify its loopback REST calls (tls/ansible-library).
     - localhost
-    - splunk-shc-search-head-service
-    - splunk-shc-search-head-service.splunk.svc
+    # Pinned identity for this tier.
     - splunk-shc-search-head-service.splunk.svc.cluster.local
-    - splunk-shc-search-head-headless
-    - "*.splunk-shc-search-head-headless.splunk.svc"
-    - "*.splunk-shc-search-head-headless.splunk.svc.cluster.local"
-    - splunk-shc-deployer-service
-    - splunk-shc-deployer-service.splunk.svc
+    - splunk-shc-search-head-headless.splunk.svc.cluster.local
+    - splunk-shc-search-head-0.splunk-shc-search-head-headless.splunk.svc.cluster.local
+    - splunk-shc-search-head-1.splunk-shc-search-head-headless.splunk.svc.cluster.local
+    - splunk-shc-search-head-2.splunk-shc-search-head-headless.splunk.svc.cluster.local
+    # The deployer is part of the SearchHeadCluster CR, so it mounts this cert.
+    - splunk-shc-deployer-service.splunk.svc.cluster.local
+    - splunk-shc-deployer-headless.splunk.svc.cluster.local
+    - splunk-shc-deployer-0.splunk-shc-deployer-headless.splunk.svc.cluster.local
 ---
 apiVersion: cert-manager.io/v1
 kind: Certificate
@@ -87,33 +128,47 @@ metadata:
   namespace: splunk
 spec:
   secretName: splunk-manager-tls
-  duration: 2160h
   renewBefore: 360h
   issuerRef:
-    name: splunk-internal
-    kind: Issuer
+    name: org-acme
+    kind: ClusterIssuer
   privateKey:
     algorithm: RSA
     size: 2048
     encoding: PKCS1
+  # Mutual TLS presents these as CLIENT certs too (S2S, forwarding). If the
+  # ACME service issues serverAuth-only certs, peers reject them as clients.
+  usages:
+    - server auth
+    - client auth
+    - digital signature
+    - key encipherment
   additionalOutputFormats:
     - type: CombinedPEM
-  commonName: splunk-managers
-  ipAddresses:
-    - 127.0.0.1
+  # KV store requires an O, OU or DC in the subject once TLS verification is
+  # on. Some ACME services strip subject fields - check the issued cert.
+  subject:
+    organizations:
+      - Example Org   # REPLACE with your org name
+  commonName: splunk-cm-cluster-manager-service.splunk.svc.cluster.local
   dnsNames:
+    # Lets splunk-ansible verify its loopback REST calls (tls/ansible-library).
     - localhost
-    - splunk-cm-cluster-manager-service
-    - splunk-cm-cluster-manager-service.splunk.svc
+    # Pinned identity for this tier.
     - splunk-cm-cluster-manager-service.splunk.svc.cluster.local
-    - splunk-lm-license-manager-service
-    - splunk-lm-license-manager-service.splunk.svc
-    - splunk-mc-monitoring-console-service
-    - splunk-mc-monitoring-console-service.splunk.svc
+    - splunk-cm-cluster-manager-headless.splunk.svc.cluster.local
+    - splunk-cm-cluster-manager-0.splunk-cm-cluster-manager-headless.splunk.svc.cluster.local
+    - splunk-lm-license-manager-service.splunk.svc.cluster.local
+    - splunk-lm-license-manager-headless.splunk.svc.cluster.local
+    - splunk-lm-license-manager-0.splunk-lm-license-manager-headless.splunk.svc.cluster.local
+    - splunk-mc-monitoring-console-service.splunk.svc.cluster.local
+    - splunk-mc-monitoring-console-headless.splunk.svc.cluster.local
+    - splunk-mc-monitoring-console-0.splunk-mc-monitoring-console-headless.splunk.svc.cluster.local
 ---
-# Browser-trusted cert for the hostnames Traefik serves. Consumed by Traefik,
-# NOT mounted into Splunk - unless you use TLS passthrough for Splunk Web, in
-# which case Splunk itself must present this cert. See traefik/README.md.
+# Browser-facing cert for the hostnames Traefik serves. Consumed by Traefik
+# only; Splunk pods never mount it (Splunk Web presents its tier cert, which
+# Traefik verifies on the re-encrypt leg). The hostnames must be ones your
+# certificate policy permits for user-facing names - replace accordingly.
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -121,18 +176,15 @@ metadata:
   namespace: splunk
 spec:
   secretName: splunk-public-tls
-  duration: 2160h
   renewBefore: 360h
   issuerRef:
-    name: letsencrypt
-    kind: Issuer
+    name: org-acme
+    kind: ClusterIssuer
   privateKey:
     algorithm: RSA
     size: 2048
-    encoding: PKCS1
-  additionalOutputFormats:
-    - type: CombinedPEM
   dnsNames:
-    - splunk.example.com
-    - mc.splunk.example.com
-    - cm.splunk.example.com
+    - splunk.example.com      # REPLACE
+    - mc.splunk.example.com   # REPLACE
+    - cm.splunk.example.com   # REPLACE
+    - hec.splunk.example.com  # REPLACE - traefik/03 terminates HEC with this cert

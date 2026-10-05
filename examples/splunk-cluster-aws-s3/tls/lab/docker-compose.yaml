@@ -1,0 +1,154 @@
+# Local lab for tls/ - five Splunk 10.4.4 containers wired the way the operator
+# wires the pods in this example, so the TLS config can be exercised end to end
+# without a Kubernetes cluster. Run it with ./lab.sh (see README.md); do not
+# `docker compose up` directly - lab.sh generates .generated/ first.
+#
+# What mirrors the operator, and from where:
+#   hostname + domainname   StatefulSet pod: /etc/hosts gets
+#                           "<ip> <pod>.<headless>.splunk.svc.cluster.local <pod>",
+#                           which is what ansible_fqdn (server_name) resolves to
+#   network aliases         the pod FQDN and the CR's -service FQDN
+#   /mnt/splunk-tls         CR volume "splunk-tls"      (cert-manager secret)
+#   /mnt/splunk-ca          CR volume "splunk-ca"       (all-trusted-partners)
+#   /mnt/tls-defaults       CR volume "tls-defaults"    (02-tls-defaults.yaml data)
+#   /mnt/ansible-library    CR volume "ansible-library" (../ansible-library)
+#   /mnt/splunk-secrets     the operator's own secrets default.yml (test stand-in)
+#   SPLUNK_DEFAULTS_URL     defaultsUrl first, secrets last - the operator's order
+#   ANSIBLE_LIBRARY         CR extraEnv
+#   SPLUNK_*_URL            what the operator emits once CR refs carry
+#                           `namespace: splunk` (FQDNs); the CM points at itself
+#                           as "localhost", exactly as the operator does
+#   SPLUNK_ROLE             the operator's role per CR kind
+#
+# Lab-only differences: no license file (trial license - the LM refuses remote
+# peers, which shows up as a licensing warning, not a TLS one), no SmartStore,
+# SPLUNK_PASSWORD also set in env, and two indexers / one search head.
+#
+# Starting the containers ACCEPTS the Splunk license and the Splunk General
+# Terms (SPLUNK_START_ARGS / SPLUNK_GENERAL_TERMS below).
+
+x-splunk: &splunk
+  image: splunk/splunk:10.4.4
+  mem_limit: 2g
+  networks: [splktls]
+  environment: &env
+    SPLUNK_START_ARGS: --accept-license
+    SPLUNK_GENERAL_TERMS: --accept-sgt-current-at-splunk-com
+    SPLUNK_PASSWORD: Tls-Lab-Passw0rd!
+    SPLUNK_TLS_CA_PATH: /mnt/splunk-ca/ca.crt
+    ANSIBLE_LIBRARY: /mnt/ansible-library:/opt/ansible/library:/opt/ansible/apps/library:/opt/ansible/ansible_commands
+
+services:
+  lm:
+    <<: *splunk
+    container_name: lab-lm
+    hostname: splunk-lm-license-manager-0
+    domainname: splunk-lm-license-manager-headless.splunk.svc.cluster.local
+    networks:
+      splktls:
+        aliases:
+          - splunk-lm-license-manager-0.splunk-lm-license-manager-headless.splunk.svc.cluster.local
+          - splunk-lm-license-manager-service.splunk.svc.cluster.local
+    volumes:
+      - ./.generated/pki/manager:/mnt/splunk-tls:ro
+      - ./.generated/pki/ca:/mnt/splunk-ca:ro
+      - ./.generated/defaults:/mnt/tls-defaults:ro
+      - ../ansible-library:/mnt/ansible-library:ro
+      - ./test-secrets.yml:/mnt/splunk-secrets/default.yml:ro
+      - ./.generated/pki:/tmp/pki:ro          # probe material for tlsprobe.py
+      - ./tlsprobe.py:/opt/lab/tlsprobe.py:ro
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_license_master
+      SPLUNK_DEFAULTS_URL: /mnt/tls-defaults/common.yml,/mnt/splunk-secrets/default.yml
+      # 03-licensemanager.yaml has clusterManagerRef, so the LM forwards its own
+      # logs to the indexers.
+      SPLUNK_CLUSTER_MASTER_URL: splunk-cm-cluster-manager-service.splunk.svc.cluster.local
+
+  cm:
+    <<: *splunk
+    container_name: lab-cm
+    hostname: splunk-cm-cluster-manager-0
+    domainname: splunk-cm-cluster-manager-headless.splunk.svc.cluster.local
+    networks:
+      splktls:
+        aliases:
+          - splunk-cm-cluster-manager-0.splunk-cm-cluster-manager-headless.splunk.svc.cluster.local
+          - splunk-cm-cluster-manager-service.splunk.svc.cluster.local
+    volumes:
+      - ./.generated/pki/manager:/mnt/splunk-tls:ro
+      - ./.generated/pki/ca:/mnt/splunk-ca:ro
+      - ./.generated/defaults:/mnt/tls-defaults:ro
+      - ../ansible-library:/mnt/ansible-library:ro
+      - ./test-secrets.yml:/mnt/splunk-secrets/default.yml:ro
+      - ./.generated/pki:/tmp/pki:ro          # probe material for tlsprobe.py
+      - ./tlsprobe.py:/opt/lab/tlsprobe.py:ro
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_cluster_master
+      SPLUNK_DEFAULTS_URL: /mnt/tls-defaults/common.yml,/mnt/splunk-secrets/default.yml
+      SPLUNK_LICENSE_MASTER_URL: splunk-lm-license-manager-service.splunk.svc.cluster.local
+      SPLUNK_CLUSTER_MASTER_URL: localhost
+
+  idx0: &indexer
+    <<: *splunk
+    container_name: lab-idx0
+    hostname: splunk-idxc-indexer-0
+    domainname: splunk-idxc-indexer-headless.splunk.svc.cluster.local
+    networks:
+      splktls:
+        aliases:
+          - splunk-idxc-indexer-0.splunk-idxc-indexer-headless.splunk.svc.cluster.local
+          - splunk-idxc-indexer-service.splunk.svc.cluster.local
+    volumes:
+      - ./.generated/pki/indexer:/mnt/splunk-tls:ro
+      - ./.generated/pki/ca:/mnt/splunk-ca:ro
+      - ./.generated/defaults:/mnt/tls-defaults:ro
+      - ../ansible-library:/mnt/ansible-library:ro
+      - ./test-secrets.yml:/mnt/splunk-secrets/default.yml:ro
+      - ./.generated/pki:/tmp/pki:ro          # probe material for tlsprobe.py
+      - ./tlsprobe.py:/opt/lab/tlsprobe.py:ro
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_indexer
+      SPLUNK_DEFAULTS_URL: /mnt/tls-defaults/indexer.yml,/mnt/splunk-secrets/default.yml
+      SPLUNK_LICENSE_MASTER_URL: splunk-lm-license-manager-service.splunk.svc.cluster.local
+      SPLUNK_CLUSTER_MASTER_URL: splunk-cm-cluster-manager-service.splunk.svc.cluster.local
+
+  idx1:
+    <<: *indexer
+    container_name: lab-idx1
+    hostname: splunk-idxc-indexer-1
+    networks:
+      splktls:
+        aliases:
+          - splunk-idxc-indexer-1.splunk-idxc-indexer-headless.splunk.svc.cluster.local
+          - splunk-idxc-indexer-service.splunk.svc.cluster.local
+
+  sh:
+    <<: *splunk
+    container_name: lab-sh
+    hostname: splunk-shc-search-head-0
+    domainname: splunk-shc-search-head-headless.splunk.svc.cluster.local
+    networks:
+      splktls:
+        aliases:
+          - splunk-shc-search-head-0.splunk-shc-search-head-headless.splunk.svc.cluster.local
+          - splunk-shc-search-head-service.splunk.svc.cluster.local
+    volumes:
+      - ./.generated/pki/searchhead:/mnt/splunk-tls:ro
+      - ./.generated/pki/ca:/mnt/splunk-ca:ro
+      - ./.generated/defaults:/mnt/tls-defaults:ro
+      - ../ansible-library:/mnt/ansible-library:ro
+      - ./test-secrets.yml:/mnt/splunk-secrets/default.yml:ro
+      - ./.generated/pki:/tmp/pki:ro          # probe material for tlsprobe.py
+      - ./tlsprobe.py:/opt/lab/tlsprobe.py:ro
+    environment:
+      <<: *env
+      SPLUNK_ROLE: splunk_search_head
+      SPLUNK_DEFAULTS_URL: /mnt/tls-defaults/common.yml,/mnt/splunk-secrets/default.yml
+      SPLUNK_LICENSE_MASTER_URL: splunk-lm-license-manager-service.splunk.svc.cluster.local
+      SPLUNK_CLUSTER_MASTER_URL: splunk-cm-cluster-manager-service.splunk.svc.cluster.local
+
+networks:
+  splktls: {}

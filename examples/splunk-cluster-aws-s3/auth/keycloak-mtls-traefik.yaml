@@ -19,10 +19,11 @@ metadata:
 spec:
   minVersion: VersionTLS12
   clientAuth:
-    # Secret(s) holding the CA that signed your USER certificates. This is your
-    # corporate/smartcard PKI - NOT the cert-manager internal CA from ../tls,
-    # which signs server certs for pod-to-pod traffic. Different trust domain,
-    # deliberately: an internal service cert must never authenticate a human.
+    # Secret(s) holding the CA that signed your USER certificates. Prefer a
+    # bundle of only the user-issuing CAs. If the org PKI issues users and
+    # servers from the same CAs (all-trusted-partners), a Splunk pod's service
+    # cert also passes this check - it must then be Keycloak's X.509 user
+    # mapping that refuses it, by matching only identities that exist as users.
     secretNames:
       - user-pki-ca
     clientAuthType: RequireAndVerifyClientCert
@@ -67,7 +68,9 @@ metadata:
   name: keycloak-backend
   namespace: keycloak
 spec:
-  serverName: keycloak.keycloak.svc
+  serverName: keycloak.keycloak.svc.cluster.local
+  # rootCAsSecrets is namespace-local: all-trusted-partners must also exist in
+  # the keycloak namespace.
   rootCAsSecrets:
-    - splunk-internal-ca
+    - all-trusted-partners
   insecureSkipVerify: false

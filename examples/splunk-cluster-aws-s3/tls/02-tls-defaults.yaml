@@ -1,0 +1,303 @@
+# splunk-ansible defaults that configure TLS for splunk/splunk:10.4.x. Mounted
+# into every CR at /mnt/tls-defaults and loaded with defaultsUrl.
+#
+# WHY DEFAULTS AND NOT A CONF APP
+#   splunk-ansible writes its own TLS and forwarding settings into
+#   etc/system/local on every pod start. system/local beats any app's default/,
+#   so an App Framework app cannot reliably override them, and it arrives only
+#   after the first start anyway. Driving the same settings through ansible's
+#   own keys (splunk.ssl, splunk.s2s, splunk.hec, http_enableSSL*, splunk.conf)
+#   puts them in system/local before splunkd first starts, on every start.
+#
+# WHAT IS ENFORCED (see tls/README.md for the reasoning and the live test)
+#   - TLS 1.2 + 1.3 only, everywhere. TLS 1.3 needs Splunk 10.4.0+.
+#   - TLS 1.2 cipher suites: exactly four (CIPHERS_TLS12 below).
+#     TLS 1.3 cipher suite: exactly one, in server.conf [tls1.3], which is
+#     global - it covers splunkd, Splunk Web, HEC, S2S and replication alike.
+#   - Server certificate verification + HOST NAME validation on every splunkd
+#     client path: [sslConfig], [pythonSslClientConfig], [kvstoreSslClientConfig]
+#     and the forwarding output. The name checked is the host in the URL being
+#     dialled, so peers must dial each other by names the certs carry - see
+#     serverName, register_*_address and the namespace on CR refs.
+#   - EXCEPTION: index replication (9887) is TLS 1.2 only - its listener
+#     ignores [tls1.3], so 1.3 there would accept any TLS 1.3 suite.
+#   - Identity pinning (sslAltNameToCheck) on top of host name validation: the
+#     org PKI also issues user certs, and pinning restricts peers to the Splunk
+#     tier certs.
+#   - CLIENT certificate verification (mutual TLS) on S2S 9997 and index
+#     replication 9887. NOT on splunkd 8089: the operator's REST client
+#     (pkg/splunk/client/enterprise.go) presents no client cert. Splunk exempts
+#     localhost-only connections from mTLS, but the operator connects from its
+#     own pod.
+#
+#   Pinned names (each is in exactly one tier cert):
+#     splunk-idxc-indexer-service.splunk.svc.cluster.local       indexers
+#     splunk-shc-search-head-service.splunk.svc.cluster.local    search heads + deployer
+#     splunk-cm-cluster-manager-service.splunk.svc.cluster.local CM + LM + MC
+#     splunk-hwf-standalone-service.splunk.svc.cluster.local     optional/ heavy forwarders
+#     splunk-ingestor-ingestor-service.splunk.svc.cluster.local  optional/ ingestors
+#   Pinning a name no deployed cert carries is harmless.
+#
+# CIPHERS_TLS12 = ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+# CIPHER_TLS13  = TLS_AES_256_GCM_SHA384
+#   The tier certs are RSA, so of the four TLS 1.2 suites only the two
+#   ECDHE-RSA ones can actually be negotiated with them.
+#   These lists are repeated per file below - a ConfigMap value cannot
+#   reference another - so change every occurrence together.
+#
+# ANSIBLE'S OWN REST CALLS are a separate client, configured by the
+# splunk_api override in tls/ansible-library/ (ANSIBLE_LIBRARY in each CR's
+# extraEnv): https://localhost:8089, verified against /mnt/splunk-ca/ca.crt.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: splunk-tls-defaults
+  namespace: splunk
+data:
+  # LicenseManager, ClusterManager, MonitoringConsole, SearchHeadCluster, and
+  # the optional/ heavy-forwarder Standalone.
+  common.yml: |
+    splunk:
+      # serverName = pod FQDN. Without it splunkd keeps $HOSTNAME (the short pod
+      # name) and the cluster manager calls peers back at https://<short>:8089,
+      # which host name validation rejects. ansible_fqdn is the FQDN from the
+      # kubelet-written /etc/hosts; ansible also uses it for
+      # register_replication_address.
+      server_name: "{{ ansible_fqdn }}"
+      # splunkd 8089 -> system/local/server.conf [sslConfig]
+      ssl:
+        enable: true
+        cert: /mnt/splunk-tls/tls-combined.pem
+        ca: /mnt/splunk-ca/ca.crt
+      # Splunk Web 8000. Presents the TIER cert: Traefik terminates the public
+      # name and re-encrypts, verifying this cert by its .svc.cluster.local name.
+      http_enableSSL: 1
+      http_enableSSL_cert: /mnt/splunk-tls/tls.crt
+      http_enableSSL_privKey: /mnt/splunk-tls/tls.key
+      # Becomes clientCert on ansible's [tcpout:group1], so these tiers forward
+      # their internal logs to the indexers over mutual TLS.
+      s2s:
+        cert: /mnt/splunk-tls/tls-combined.pem
+      conf:
+        - key: server
+          value:
+            content:
+              # serverName must be the FQDN BEFORE splunkd first starts: peers
+              # register with it and the CM calls them back on it. splunk-ansible
+              # applies server_name (above) only after start, too late for the
+              # first join; this conf entry is written pre-start.
+              general:
+                serverName: "{{ ansible_fqdn }}"
+              sslConfig:
+                sslVersions: tls1.2,tls1.3
+                sslVersionsForClient: tls1.2,tls1.3
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+                sslVerifyServerCert: "true"
+                sslVerifyServerName: "true"
+                sslAltNameToCheck: splunk-idxc-indexer-service.splunk.svc.cluster.local, splunk-shc-search-head-service.splunk.svc.cluster.local, splunk-cm-cluster-manager-service.splunk.svc.cluster.local, splunk-hwf-standalone-service.splunk.svc.cluster.local, splunk-ingestor-ingestor-service.splunk.svc.cluster.local
+              tls1.3:
+                cipherSuite: TLS_AES_256_GCM_SHA384
+              pythonSslClientConfig:
+                sslVerifyServerCert: "true"
+                sslVerifyServerName: "true"
+              kvstoreSslClientConfig:
+                # Required once anything is set in this stanza (10.4 spec): without
+                # it splunkd launches mongod with an empty --tlsClusterFile and
+                # KV store fails ("Invalid MongoSSLOption: pem_file"). Found in the lab.
+                clientCert: /mnt/splunk-tls/tls-combined.pem
+                sslVerifyServerCert: "true"
+                # Host name check OFF for KV store only. splunkd dials its own
+                # mongod at <short-hostname>:8191 on every non-SHC instance (LM,
+                # CM, MC, deployer, HWF, ingestors); the SAN policy forbids short
+                # names and [kvstore] replication_host has no effect on a single
+                # instance (lab: "hostname mismatch calling hello on
+                # splunk-shc-search-head-0:8191"). Chain verification and the
+                # client cert stay on; the connection never leaves the pod.
+                sslVerifyServerName: "false"
+        - key: web
+          value:
+            content:
+              settings:
+                sslVersions: tls1.2,tls1.3
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+        - key: outputs
+          value:
+            content:
+              # group1 is the tcpout group ansible creates for indexer discovery.
+              tcpout:group1:
+                sslVerifyServerCert: "true"
+                sslVerifyServerName: "true"
+                sslAltNameToCheck: splunk-idxc-indexer-service.splunk.svc.cluster.local
+                sslVersions: tls1.2,tls1.3
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+
+  # optional/ IngestorCluster. Same as common.yml minus outputs: ingestors have
+  # no clusterManagerRef, so ansible creates no [tcpout:group1] to harden.
+  ingestor.yml: |
+    splunk:
+      # serverName = pod FQDN. Without it splunkd keeps $HOSTNAME (the short pod
+      # name) and the cluster manager calls peers back at https://<short>:8089,
+      # which host name validation rejects. ansible_fqdn is the FQDN from the
+      # kubelet-written /etc/hosts; ansible also uses it for
+      # register_replication_address.
+      server_name: "{{ ansible_fqdn }}"
+      ssl:
+        enable: true
+        cert: /mnt/splunk-tls/tls-combined.pem
+        ca: /mnt/splunk-ca/ca.crt
+      http_enableSSL: 1
+      http_enableSSL_cert: /mnt/splunk-tls/tls.crt
+      http_enableSSL_privKey: /mnt/splunk-tls/tls.key
+      conf:
+        - key: server
+          value:
+            content:
+              # serverName must be the FQDN BEFORE splunkd first starts: peers
+              # register with it and the CM calls them back on it. splunk-ansible
+              # applies server_name (above) only after start, too late for the
+              # first join; this conf entry is written pre-start.
+              general:
+                serverName: "{{ ansible_fqdn }}"
+              sslConfig:
+                sslVersions: tls1.2,tls1.3
+                sslVersionsForClient: tls1.2,tls1.3
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+                sslVerifyServerCert: "true"
+                sslVerifyServerName: "true"
+                sslAltNameToCheck: splunk-idxc-indexer-service.splunk.svc.cluster.local, splunk-shc-search-head-service.splunk.svc.cluster.local, splunk-cm-cluster-manager-service.splunk.svc.cluster.local, splunk-hwf-standalone-service.splunk.svc.cluster.local, splunk-ingestor-ingestor-service.splunk.svc.cluster.local
+              tls1.3:
+                cipherSuite: TLS_AES_256_GCM_SHA384
+              pythonSslClientConfig:
+                sslVerifyServerCert: "true"
+                sslVerifyServerName: "true"
+              kvstoreSslClientConfig:
+                # Required once anything is set in this stanza (10.4 spec): without
+                # it splunkd launches mongod with an empty --tlsClusterFile and
+                # KV store fails ("Invalid MongoSSLOption: pem_file"). Found in the lab.
+                clientCert: /mnt/splunk-tls/tls-combined.pem
+                sslVerifyServerCert: "true"
+                # Host name check OFF for KV store only. splunkd dials its own
+                # mongod at <short-hostname>:8191 on every non-SHC instance (LM,
+                # CM, MC, deployer, HWF, ingestors); the SAN policy forbids short
+                # names and [kvstore] replication_host has no effect on a single
+                # instance (lab: "hostname mismatch calling hello on
+                # splunk-shc-search-head-0:8191"). Chain verification and the
+                # client cert stay on; the connection never leaves the pod.
+                sslVerifyServerName: "false"
+        - key: web
+          value:
+            content:
+              settings:
+                sslVersions: tls1.2,tls1.3
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+
+  # IndexerCluster.
+  indexer.yml: |
+    splunk:
+      # serverName = pod FQDN. Without it splunkd keeps $HOSTNAME (the short pod
+      # name) and the cluster manager calls peers back at https://<short>:8089,
+      # which host name validation rejects. ansible_fqdn is the FQDN from the
+      # kubelet-written /etc/hosts; ansible also uses it for
+      # register_replication_address.
+      server_name: "{{ ansible_fqdn }}"
+      ssl:
+        enable: true
+        cert: /mnt/splunk-tls/tls-combined.pem
+        ca: /mnt/splunk-ca/ca.crt
+      http_enableSSL: 1
+      http_enableSSL_cert: /mnt/splunk-tls/tls.crt
+      http_enableSSL_privKey: /mnt/splunk-tls/tls.key
+      # S2S receiving 9997 -> [splunktcp-ssl:9997] + [SSL]. ca is required:
+      # without it ansible points rootCA at Splunk's shipped cacert.pem.
+      s2s:
+        ssl: true
+        cert: /mnt/splunk-tls/tls-combined.pem
+        ca: /mnt/splunk-ca/ca.crt
+      # HEC 8088. Traefik re-encrypts to it and verifies this cert (traefik/03).
+      hec:
+        ssl: true
+        cert: /mnt/splunk-tls/tls-combined.pem
+      # Index replication over TLS. 10.4's splunk-ansible (CSPL-4006) sees the
+      # replication_port-ssl stanza below and drops the plaintext one it would
+      # otherwise write.
+      idxc:
+        replication_ssl: true
+      conf:
+        - key: server
+          value:
+            content:
+              # serverName must be the FQDN BEFORE splunkd first starts: peers
+              # register with it and the CM calls them back on it. splunk-ansible
+              # applies server_name (above) only after start, too late for the
+              # first join; this conf entry is written pre-start.
+              general:
+                serverName: "{{ ansible_fqdn }}"
+              sslConfig:
+                sslVersions: tls1.2,tls1.3
+                sslVersionsForClient: tls1.2,tls1.3
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+                sslVerifyServerCert: "true"
+                sslVerifyServerName: "true"
+                sslAltNameToCheck: splunk-idxc-indexer-service.splunk.svc.cluster.local, splunk-shc-search-head-service.splunk.svc.cluster.local, splunk-cm-cluster-manager-service.splunk.svc.cluster.local, splunk-hwf-standalone-service.splunk.svc.cluster.local, splunk-ingestor-ingestor-service.splunk.svc.cluster.local
+              tls1.3:
+                cipherSuite: TLS_AES_256_GCM_SHA384
+              pythonSslClientConfig:
+                sslVerifyServerCert: "true"
+                sslVerifyServerName: "true"
+              kvstoreSslClientConfig:
+                # Required once anything is set in this stanza (10.4 spec): without
+                # it splunkd launches mongod with an empty --tlsClusterFile and
+                # KV store fails ("Invalid MongoSSLOption: pem_file"). Found in the lab.
+                clientCert: /mnt/splunk-tls/tls-combined.pem
+                sslVerifyServerCert: "true"
+                # Host name check OFF for KV store only. splunkd dials its own
+                # mongod at <short-hostname>:8191 on every non-SHC instance (LM,
+                # CM, MC, deployer, HWF, ingestors); the SAN policy forbids short
+                # names and [kvstore] replication_host has no effect on a single
+                # instance (lab: "hostname mismatch calling hello on
+                # splunk-shc-search-head-0:8191"). Chain verification and the
+                # client cert stay on; the connection never leaves the pod.
+                sslVerifyServerName: "false"
+              # Peers advertise their pod FQDN, not their pod IP, to forwarders
+              # (indexer discovery) and search heads. Host name validation
+              # checks the name dialled, and no IP may appear in a SAN.
+              # Templated per pod by ansible: ansible_fqdn is the pod FQDN from the
+              # kubelet-written /etc/hosts. (Not splunk.server_name - a value
+              # inside the splunk dict that references splunk recurses.)
+              clustering:
+                register_forwarder_address: "{{ ansible_fqdn }}"
+                register_search_address: "{{ ansible_fqdn }}"
+              replication_port-ssl://9887:
+                serverCert: /mnt/splunk-tls/tls-combined.pem
+                requireClientCert: "true"
+                sslAltNameToCheck: splunk-idxc-indexer-service.splunk.svc.cluster.local
+                # TLS 1.2 ONLY here. The replication listener ignores the global
+                # [tls1.3] cipherSuite (lab: it accepted every TLS 1.3 suite) and
+                # has no TLS 1.3 setting of its own, so TLS 1.3 is switched off on
+                # this port to keep the cipher policy enforced. Peers negotiate
+                # 1.2 automatically (sslVersionsForClient includes it).
+                sslVersions: tls1.2
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+        - key: web
+          value:
+            content:
+              settings:
+                sslVersions: tls1.2,tls1.3
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+        - key: inputs
+          value:
+            content:
+              # Mutual TLS on S2S. Only the Splunk tiers' own certs may send -
+              # NOT any cert the org PKI issued. Add the SAN of each external
+              # forwarder's cert here if forwarders outside the cluster send
+              # through traefik/03.
+              SSL:
+                requireClientCert: "true"
+                sslVersions: tls1.2,tls1.3
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256
+                sslAltNameToCheck: splunk-shc-search-head-service.splunk.svc.cluster.local, splunk-cm-cluster-manager-service.splunk.svc.cluster.local, splunk-hwf-standalone-service.splunk.svc.cluster.local
+              # HEC is token-authenticated; no client cert.
+              http:
+                sslVersions: tls1.2,tls1.3
+                cipherSuite: ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256

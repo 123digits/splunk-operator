@@ -1,72 +1,52 @@
-# cert-manager issuers.
+# Trust and issuance - organisation PKI.
 #
-# TWO separate trust domains, deliberately:
+# This deployment does NOT mint its own CA. Every certificate comes from the
+# organisation's ACME service, which signs with one of several org issuers,
+# and every verifier trusts the org's CA bundle. Two consequences shape the
+# rest of tls/:
 #
-#   internal  - a private CA whose certs secure Splunk-to-Splunk traffic
-#               (splunkd 8089, S2S 9997, index replication 9887). Nothing
-#               outside the cluster validates these, so a private CA is right
-#               and avoids burning public cert quota on pod churn.
+#   1. cert-manager's ca.crt is not usable as a trust anchor. ACME issuers
+#      leave ca.crt empty or absent in the certificate secret, and even when
+#      populated it would hold one issuer, not the whole org bundle. So the
+#      bundle comes from the existing all-trusted-partners Secret, and every
+#      sslRootCAPath / --cacert / rootCAsSecrets points at it.
 #
-#   public    - a real, browser-trusted cert for the UI hostnames that users
-#               and forwarders outside the cluster hit through Traefik.
+#   2. The same PKI signs USER certificates. Chain verification alone would
+#      therefore accept any employee's cert as a Splunk peer. 02-tls-defaults
+#      pins acceptable peer identities with sslAltNameToCheck to close that.
+#
+# ORG CA BUNDLE: the existing Secret all-trusted-partners, key ca.crt, holding
+# every root and intermediate of every org issuer. Nothing here creates it.
+# Each CR mounts it as volume "splunk-ca" (-> /mnt/splunk-ca/ca.crt) and
+# Traefik reads it directly via rootCAsSecrets. It must exist in the splunk
+# namespace - pods cannot mount Secrets across namespaces - so copy or sync it
+# (trust-manager, reflector, ...) if it lives elsewhere. An issuer missing from
+# the bundle shows up as "self signed certificate in certificate chain" for
+# whichever pods that issuer signed.
 ---
-# Bootstrap: a self-signed issuer used only to mint the internal CA below.
+# The org ACME issuer. Most organisations already run this as a ClusterIssuer;
+# if so, delete this object and set issuerRef in 01-certificates.yaml to its
+# name. Shown only so the shape is clear - server, caBundle and solver are
+# entirely org-specific.
 apiVersion: cert-manager.io/v1
-kind: Issuer
+kind: ClusterIssuer
 metadata:
-  name: selfsigned-bootstrap
-  namespace: splunk
-spec:
-  selfSigned: {}
----
-# The internal CA certificate itself. Long-lived; rotating it means restarting
-# every Splunk pod, so treat it as infrastructure.
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: splunk-internal-ca
-  namespace: splunk
-spec:
-  isCA: true
-  commonName: splunk-internal-ca
-  secretName: splunk-internal-ca
-  duration: 43800h    # 5 years
-  renewBefore: 8760h  # 1 year
-  privateKey:
-    algorithm: RSA
-    size: 4096
-  issuerRef:
-    name: selfsigned-bootstrap
-    kind: Issuer
----
-# Issues the per-tier certs from the CA above.
-apiVersion: cert-manager.io/v1
-kind: Issuer
-metadata:
-  name: splunk-internal
-  namespace: splunk
-spec:
-  ca:
-    secretName: splunk-internal-ca
----
-# Public issuer for UI hostnames. DNS-01 shown because Splunk Web sits behind
-# TLS passthrough, so HTTP-01 cannot be solved through Traefik for that host.
-apiVersion: cert-manager.io/v1
-kind: Issuer
-metadata:
-  name: letsencrypt
-  namespace: splunk
+  name: org-acme
 spec:
   acme:
-    server: https://acme-v02.api.letsencrypt.org/directory
-    email: platform@example.com
+    server: https://acme.example.internal/acme/directory   # REPLACE
+    email: platform@example.com                            # REPLACE
+    # The ACME server's own TLS cert is from the org PKI, so cert-manager must
+    # trust the org bundle to talk to it at all. Base64 of the same PEM as
+    # all-trusted-partners' ca.crt.
+    caBundle: <BASE64_ORG_CA_BUNDLE>                       # REPLACE
     privateKeySecretRef:
-      name: letsencrypt-account-key
+      name: org-acme-account-key
     solvers:
-      - dns01:
-          route53:
-            region: us-east-1
-            # With kiam, annotate the cert-manager pod for a role allowing
-            # route53:ChangeResourceRecordSets on the hosted zone, exactly as
-            # the Splunk pods are annotated. IRSA fields would not apply here.
-            hostedZoneID: <HOSTED_ZONE_ID>
+      # REPLACE with the solver your ACME service expects for *.svc.cluster.local
+      # names. These are not publicly resolvable, so whatever the org uses for
+      # in-cluster names (internal HTTP-01, DNS-01 against an internal zone, or
+      # a policy-based EAB account) goes here.
+      - http01:
+          ingress:
+            ingressClassName: traefik

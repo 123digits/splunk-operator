@@ -8,32 +8,45 @@ metadata:
   finalizers:
   - enterprise.splunk.com/delete-pvc
 spec:
-  # cert-manager secret mounted at /mnt/splunk-tls (operator mounts custom
-  # volumes at /mnt/<name> in every container). tls-combined.pem is the
-  # key+cert file Splunk's serverCert wants; ca.crt is what the verifying
-  # probes and peer checks validate against.
+  # TLS - see tls/README.md and the same block in 03-licensemanager.yaml.
   volumes:
     - name: splunk-tls
       secret:
         secretName: splunk-manager-tls
         defaultMode: 0400
-    - name: splunk-public-tls
+    - name: splunk-ca
       secret:
-        secretName: splunk-public-tls
-        defaultMode: 0400
+        secretName: all-trusted-partners
+        defaultMode: 0444
+    - name: tls-defaults
+      configMap:
+        name: splunk-tls-defaults
+    - name: ansible-library
+      configMap:
+        name: splunk-ansible-library
+  defaultsUrl: /mnt/tls-defaults/common.yml
   extraEnv:
-    # Splunk Web over TLS. Probes target 8089, not 8000, so this does not
-    # affect health checking.
-    - name: SPLUNK_HTTP_ENABLESSL
-      value: "true"
-    # Consumed by the verifying probe scripts in tls/probes/.
     - name: SPLUNK_TLS_CA_PATH
-      value: /mnt/splunk-tls/ca.crt
-  image: splunk/splunk:10.2.0
+      value: /mnt/splunk-ca/ca.crt
+    # Verifying splunk_api override - see 03-licensemanager.yaml.
+    - name: ANSIBLE_LIBRARY
+      value: /mnt/ansible-library:/opt/ansible/library:/opt/ansible/apps/library:/opt/ansible/ansible_commands
+    # The operator always passes the deployer as a short service name, and the
+    # members (and the MC) dial it with host name validation on. extraEnv
+    # entries take precedence over the operator's own env and envFrom.
+    - name: SPLUNK_DEPLOYER_URL
+      value: splunk-shc-deployer-service.splunk.svc.cluster.local
+  image: splunk/splunk:10.4.4
   licenseManagerRef:
     name: lm
+    # namespace makes the operator pass the FQDN (…svc.cluster.local), not
+    # the short service name: TLS host name validation checks the name dialled.
+    namespace: splunk
   clusterManagerRef:
     name: cm
+    # namespace makes the operator pass the FQDN (…svc.cluster.local), not
+    # the short service name: TLS host name validation checks the name dialled.
+    namespace: splunk
   etcVolumeStorageConfig:
     storageClassName: splunk-gp3
     storageCapacity: 10Gi

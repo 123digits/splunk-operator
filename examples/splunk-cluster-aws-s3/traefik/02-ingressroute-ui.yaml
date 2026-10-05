@@ -1,7 +1,7 @@
 # Splunk Web UIs via Traefik, TLS terminated at the edge and RE-ENCRYPTED to
 # the pods. Traffic is never in plaintext, and both legs are authenticated:
-# the browser verifies the public cert, Traefik verifies the backend against
-# our internal CA (see 01-serverstransport.yaml).
+# the browser verifies the public cert, Traefik verifies the backend's tier
+# cert against the org CA bundle (see 01-serverstransport.yaml).
 #
 # Why this model rather than TLS passthrough: passthrough is pure TCP, so
 # Traefik cannot set a cookie, and Splunk Web on a 3-member search head cluster

@@ -16,6 +16,14 @@
 # HostSNI requires the forwarder to send SNI. Splunk forwarders do when
 # configured with a server name; if yours do not, use HostSNI(`*`) on a
 # dedicated entrypoint, which matches any connection on that port.
+#
+# Because this is passthrough, an external forwarder sees the INDEXER's cert,
+# which carries only .svc.cluster.local names - never ingest.splunk.example.com.
+# On the forwarder, pin the identity instead of matching the dialled name:
+#   sslVerifyServerCert = true
+#   sslAltNameToCheck   = splunk-idxc-indexer-service.splunk.svc.cluster.local
+# and add a SAN of the forwarder's own client cert to the indexers' inputs
+# [SSL] sslAltNameToCheck in tls/02-tls-defaults.yaml, or it is refused.
 ---
 apiVersion: traefik.io/v1alpha1
 kind: IngressRouteTCP
@@ -61,7 +69,7 @@ metadata:
   name: splunk-indexer-hec
   namespace: splunk
 spec:
-  serverName: splunk-idxc-indexer-service.splunk.svc
+  serverName: splunk-idxc-indexer-service.splunk.svc.cluster.local
   rootCAsSecrets:
-    - splunk-internal-ca
+    - all-trusted-partners
   insecureSkipVerify: false
