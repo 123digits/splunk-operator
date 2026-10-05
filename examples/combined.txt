@@ -2031,7 +2031,8 @@ routes:
 
 #### Prefer a native splunk-ansible variable where one exists
 
-`root_endpoint` is first-class. `roles/splunk_common/tasks/set_root_endpoint.yml`
+`root_endpoint` is first-class. splunk-ansible's
+[`roles/splunk_common/tasks/set_root_endpoint.yml`](https://github.com/splunk/splunk-ansible/blob/develop/roles/splunk_common/tasks/set_root_endpoint.yml)
 writes it straight into `$SPLUNK_HOME/etc/system/local/web.conf` under
 `[settings]` and triggers a restart if it changed — no `conf` block needed:
 
@@ -2097,12 +2098,17 @@ which does have `appRepo`.
 
 #### What `defaults` actually supports
 
+> **Paths in this subsection are in
+> [splunk/splunk-ansible](https://github.com/splunk/splunk-ansible), a separate
+> repository — not in splunk-operator.** The operator has no `docs/advanced/`,
+> `inventory/` or `roles/` directory.
+
 `defaults` is splunk-ansible's `default.yml`, so the supported surface is
 splunk-ansible's, not the operator's — the operator just mounts the file and
 sets `SPLUNK_DEFAULTS_URL`. Two sources disagree slightly and you need both:
 
-- `docs/advanced/default.yml.spec.md` documents **78** `splunk.*` keys
-- `inventory/splunk_defaults_linux.yml` defines defaults for **56**
+- [`docs/advanced/default.yml.spec.md`](https://github.com/splunk/splunk-ansible/blob/develop/docs/advanced/default.yml.spec.md) documents **78** `splunk.*` keys
+- [`inventory/splunk_defaults_linux.yml`](https://github.com/splunk/splunk-ansible/blob/develop/inventory/splunk_defaults_linux.yml) defines defaults for **56**
 
 Neither is a superset. `conf`, `site`, `all_sites`, `multisite_master`,
 `apps_location` and `role` are documented and consumed by the roles but have no
@@ -2144,21 +2150,23 @@ confirm with `btool`.
 
 A key having a default does not mean the roles act on it for your tier: several
 are only consumed by specific roles (`preferred_captaincy` by search heads,
-`site` by multisite). Grep `roles/` in splunk-ansible if unsure.
+`site` by multisite). Grep `roles/` in the splunk-ansible repo if unsure.
 
 #### Sources
 
 - `splunk.conf` structure and the warning above:
   [`docs/advanced/default.yml.spec.md`](https://github.com/splunk/splunk-ansible/blob/develop/docs/advanced/default.yml.spec.md)
   in splunk/splunk-ansible (read at commit `4404635`)
-- `root_endpoint` handling: `roles/splunk_common/tasks/set_root_endpoint.yml`,
+- `root_endpoint` handling:
+  [`roles/splunk_common/tasks/set_root_endpoint.yml`](https://github.com/splunk/splunk-ansible/blob/develop/roles/splunk_common/tasks/set_root_endpoint.yml),
   same repo
 - No `appRepo` on IndexerCluster: `api/v4/indexercluster_types.go` versus the
   other `api/v4/*_types.go`
 - defaults plumbing: `pkg/splunk/enterprise/configuration.go:860,932,947`
-- supported key surface: `docs/advanced/default.yml.spec.md` and
-  `inventory/splunk_defaults_linux.yml`, both in splunk/splunk-ansible at
-  commit `4404635`
+- supported key surface:
+  [`docs/advanced/default.yml.spec.md`](https://github.com/splunk/splunk-ansible/blob/develop/docs/advanced/default.yml.spec.md) and
+  [`inventory/splunk_defaults_linux.yml`](https://github.com/splunk/splunk-ansible/blob/develop/inventory/splunk_defaults_linux.yml),
+  both in splunk/splunk-ansible at commit `4404635`
 
 ## 6. Operator app-staging volume
 
