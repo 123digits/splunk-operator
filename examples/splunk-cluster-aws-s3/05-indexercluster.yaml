@@ -56,6 +56,42 @@ spec:
   monitoringConsoleRef:
     name: mc
 
+  # ---- Arbitrary .conf settings on a tier with no appRepo ----
+  #
+  # IndexerCluster has NO appRepo field, so you cannot ship an app to it
+  # directly. Two routes exist, and `defaults` is the one for small settings:
+  #
+  #   defaults  -> rendered to a ConfigMap, mounted at
+  #                /mnt/splunk-defaults/default.yml and passed to the container
+  #                as SPLUNK_DEFAULTS_URL, where splunk-ansible applies it.
+  #                Good for a handful of keys. Applied at container start.
+  #
+  #   ClusterManager appRepo, scope: cluster -> bundle-pushed to peers as
+  #                etc/peer-apps. Use for anything app-shaped, or where you want
+  #                the config versioned in S3 rather than in the CR.
+  #
+  # splunk.conf is a LIST. Each entry's `key` is the conf file name without the
+  # extension, `directory` defaults to /opt/splunk/etc/system/local, and
+  # `content` maps stanza -> key/value.
+  #
+  # Example writing /opt/splunk/etc/system/local/web.conf. Commented out because
+  # tools.proxy.on is almost certainly NOT what you want - see README section 5.
+  #
+  # defaults: |-
+  #   splunk:
+  #     conf:
+  #       - key: web
+  #         value:
+  #           directory: /opt/splunk/etc/system/local
+  #           content:
+  #             settings:
+  #               tools.proxy.on: false
+  #               root_endpoint: /splunk
+  #
+  # Verify what actually landed:
+  #   kubectl -n splunk exec splunk-idxc-indexer-0 -- \
+  #     /opt/splunk/bin/splunk btool web list settings --debug
+
   etcVolumeStorageConfig:
     storageClassName: splunk-gp3
     storageCapacity: 15Gi
