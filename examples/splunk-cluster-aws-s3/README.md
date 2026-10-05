@@ -575,18 +575,32 @@ endpoint above.
 
 ### Arbitrary .conf settings (including web.conf)
 
-`IndexerCluster` has **no `appRepo`**, so you cannot ship it an app directly.
-Two routes:
+`IndexerCluster` has **no `appRepo`** — it is the one CR kind in `api/v4/` whose
+spec omits `AppFrameworkConfig`, so you cannot ship it an app directly. Two
+routes:
 
 | Route | Use for | Mechanism |
 |---|---|---|
 | `defaults:` on the CR | A handful of keys | ConfigMap → `/mnt/splunk-defaults/default.yml` → `SPLUNK_DEFAULTS_URL` → splunk-ansible |
 | ClusterManager `appRepo`, `scope: cluster` | Anything app-shaped | Bundle push → peers' `etc/peer-apps` |
 
-`defaults` takes splunk-ansible's `default.yml` syntax, and `splunk.conf` writes
-any conf file. It is a **list**; `key` is the filename without extension,
-`directory` defaults to `/opt/splunk/etc/system/local`, `content` maps stanza to
-key/values:
+#### Prefer a native splunk-ansible variable where one exists
+
+`root_endpoint` is first-class. `roles/splunk_common/tasks/set_root_endpoint.yml`
+writes it straight into `$SPLUNK_HOME/etc/system/local/web.conf` under
+`[settings]` and triggers a restart if it changed — no `conf` block needed:
+
+```yaml
+spec:
+  defaults: |-
+    splunk:
+      root_endpoint: /splunk
+```
+
+#### Otherwise, `splunk.conf` writes any conf file
+
+A **list**; `key` is the filename without `.conf`, `directory` defaults to
+`/opt/splunk/etc/system/local`, `content` maps stanza → key/values:
 
 ```yaml
 spec:
@@ -598,32 +612,54 @@ spec:
             directory: /opt/splunk/etc/system/local
             content:
               settings:
-                root_endpoint: /splunk
+                some_setting: value
 ```
 
-Applied at container start, so a change means a pod restart. Verify with:
+splunk-ansible's own spec carries a warning worth repeating verbatim:
+
+> **Using this method of configuration file generation may not create a
+> configuration file the way Splunk expects. Verify the generated configuration
+> file to avoid errors. Use at your own discretion**
+
+So always check what landed:
 
 ```bash
 kubectl -n splunk exec splunk-idxc-indexer-0 -- \
   /opt/splunk/bin/splunk btool web list settings --debug
 ```
 
-**On `tools.proxy.on`:** Splunk's documentation scopes this to **Apache 1.x**.
-For any later proxy — Traefik, nginx, ALB — it should be `false` or left unset.
-Setting it true in front of a modern proxy produces malformed redirects. If
+Either route applies at container start, so a change means a pod restart.
+
+#### On the specific proxy settings
+
+**`tools.proxy.on`** — Splunk's documentation scopes this to **Apache 1.x**; for
+a later proxy (Traefik, nginx, ALB) it should be `false` or left unset. If
 Splunk Web is not at the proxy's root, `root_endpoint` is the setting you want.
+*Source: Splunk docs via search summary — the docs host is blocked from this
+environment, so confirm against `web.conf.spec` for your version.*
 
-**On `enable_proxy_write`:** this is not a documented `web.conf` setting. Check
-it against `web.conf.spec` for your version before relying on it — an unknown
-key is silently ignored, so it will look applied while doing nothing. If you
-meant Splunk's *outbound* proxy (for apps reaching the internet), that is
-`server.conf` `[proxyConfig]` with `http_proxy` / `https_proxy`, not `web.conf`.
+**`enable_proxy_write`** — not a documented `web.conf` setting, and it appears
+nowhere in the splunk-ansible source either. An unknown key is silently
+ignored, so it would look applied while doing nothing. If you meant Splunk's
+*outbound* proxy (for apps reaching the internet), that is `server.conf`
+`[proxyConfig]` with `http_proxy` / `https_proxy`.
 
-**Do the indexers even need this?** Splunk Web on indexers is not exposed in
-this deployment — `08-ingest-endpoints.yaml` publishes 9997 and 8088 only, and
-the UI routes in `traefik/` point at the search heads and monitoring console.
-If the goal is Splunk Web behind a proxy, the tier that needs it is the
-SearchHeadCluster, which does have `appRepo`.
+**Which tier?** Splunk Web is not exposed on the indexers here —
+`08-ingest-endpoints.yaml` publishes 9997 and 8088 only, and the UI routes in
+`traefik/` point at the search heads and monitoring console. If the goal is
+Splunk Web behind a proxy, the tier that needs it is the SearchHeadCluster,
+which does have `appRepo`.
+
+#### Sources
+
+- `splunk.conf` structure and the warning above:
+  [`docs/advanced/default.yml.spec.md`](https://github.com/splunk/splunk-ansible/blob/develop/docs/advanced/default.yml.spec.md)
+  in splunk/splunk-ansible (read at commit `4404635`)
+- `root_endpoint` handling: `roles/splunk_common/tasks/set_root_endpoint.yml`,
+  same repo
+- No `appRepo` on IndexerCluster: `api/v4/indexercluster_types.go` versus the
+  other `api/v4/*_types.go`
+- defaults plumbing: `pkg/splunk/enterprise/configuration.go:860,932,947`
 
 ## 6. Operator app-staging volume
 

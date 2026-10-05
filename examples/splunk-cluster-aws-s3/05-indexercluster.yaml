@@ -61,6 +61,10 @@ spec:
   # IndexerCluster has NO appRepo field, so you cannot ship an app to it
   # directly. Two routes exist, and `defaults` is the one for small settings:
   #
+  # Prefer a native splunk-ansible variable when one exists: root_endpoint is
+  # written directly to etc/system/local/web.conf [settings] by
+  # roles/splunk_common/tasks/set_root_endpoint.yml, no conf block needed.
+  #
   #   defaults  -> rendered to a ConfigMap, mounted at
   #                /mnt/splunk-defaults/default.yml and passed to the container
   #                as SPLUNK_DEFAULTS_URL, where splunk-ansible applies it.
@@ -74,8 +78,10 @@ spec:
   # extension, `directory` defaults to /opt/splunk/etc/system/local, and
   # `content` maps stanza -> key/value.
   #
-  # Example writing /opt/splunk/etc/system/local/web.conf. Commented out because
-  # tools.proxy.on is almost certainly NOT what you want - see README section 5.
+  # splunk-ansible's spec warns that this method "may not create a configuration
+  # file the way Splunk expects" and to verify the result - hence the btool check
+  # below. Commented out because tools.proxy.on is almost certainly NOT what you
+  # want behind Traefik; see README section 5.
   #
   # defaults: |-
   #   splunk:
