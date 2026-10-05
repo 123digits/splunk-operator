@@ -2095,6 +2095,57 @@ ignored, so it would look applied while doing nothing. If you meant Splunk's
 Splunk Web behind a proxy, the tier that needs it is the SearchHeadCluster,
 which does have `appRepo`.
 
+#### What `defaults` actually supports
+
+`defaults` is splunk-ansible's `default.yml`, so the supported surface is
+splunk-ansible's, not the operator's — the operator just mounts the file and
+sets `SPLUNK_DEFAULTS_URL`. Two sources disagree slightly and you need both:
+
+- `docs/advanced/default.yml.spec.md` documents **78** `splunk.*` keys
+- `inventory/splunk_defaults_linux.yml` defines defaults for **56**
+
+Neither is a superset. `conf`, `site`, `all_sites`, `multisite_master`,
+`apps_location` and `role` are documented and consumed by the roles but have no
+default entry; `es`, `splunk_secret`, `cloud_build`, `enable_tcp_mode` and
+`uds_socket_path_url` have defaults but are undocumented. The union, grouped:
+
+**Clustering / topology**
+
+`site`, `all_sites`, `multisite_master`, `multisite_master_port`, `cluster_master_url`, `license_master_url`, `deployer_url`, `search_head_captain_url`, `search_head_cluster_url`, `role`, `host`, `preferred_captaincy`, `set_search_peers`, `auxiliary_cluster_masters`, `multisite_replication_factor_origin`, `multisite_replication_factor_total`, `multisite_replication_factor_sites`, `multisite_search_factor_origin`, `multisite_search_factor_total`, `multisite_search_factor_sites`
+
+**Web / ports**
+
+`root_endpoint`, `http_port`, `svc_port`, `http_enableSSL`, `http_enableSSL_cert`, `http_enableSSL_privKey`, `http_enableSSL_privKey_password`, `appserver`, `s2s_port`, `s2s_enable`, `enable_tcp_mode`, `uds_socket_path_url`
+
+**Secrets / auth**
+
+`password`, `admin_user`, `pass4SymmKey`, `secret`, `splunk_secret`, `declarative_admin_password`
+
+**Apps / conf**
+
+`conf`, `apps_location`, `app_paths`, `app_paths_install`, `defaults_dir`, `env`
+
+**Licensing**
+
+`license_uri`, `wildcard_license`, `ignore_license`, `license_download_dest`
+
+**Nested subsystems**
+
+`idxc`, `shc`, `hec`, `s2s`, `ssl`, `kvstore`, `dfs`, `dsp`, `es`, `deployment_client`
+
+**Other**
+
+`allow_upgrade`, `asan`, `baked`, `build_location`, `build_location_rpm_key`, `build_url_bearer_token`, `cloud_build`, `connection_timeout`, `disable_popups`, `enable_service`, `exec`, `group`, `home`, `launch`, `manual_monitor_list`, `max_delay`, `max_retries`, `max_timeout`, `opt`, `pid`, `service_name`, `smartstore`, `tar_dir`, `upgrade`, `user`
+
+Anything not in that list is **not** a `defaults` key. It will be accepted into
+the YAML and silently ignored, which is the failure mode to watch for — nothing
+validates it. Use `splunk.conf` for settings with no dedicated variable, and
+confirm with `btool`.
+
+A key having a default does not mean the roles act on it for your tier: several
+are only consumed by specific roles (`preferred_captaincy` by search heads,
+`site` by multisite). Grep `roles/` in splunk-ansible if unsure.
+
 #### Sources
 
 - `splunk.conf` structure and the warning above:
@@ -2105,6 +2156,9 @@ which does have `appRepo`.
 - No `appRepo` on IndexerCluster: `api/v4/indexercluster_types.go` versus the
   other `api/v4/*_types.go`
 - defaults plumbing: `pkg/splunk/enterprise/configuration.go:860,932,947`
+- supported key surface: `docs/advanced/default.yml.spec.md` and
+  `inventory/splunk_defaults_linux.yml`, both in splunk/splunk-ansible at
+  commit `4404635`
 
 ## 6. Operator app-staging volume
 
